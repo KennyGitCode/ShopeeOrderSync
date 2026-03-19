@@ -1,0 +1,7 @@
+{
+  "googleSheets": {
+    "spreadsheetUrl": "https://docs.google.com/spreadsheets/d/YOUR_SPREADSHEET_ID/edit",
+    "worksheetName": "預定(大陸現貨)",
+    "serviceAccountJsonPath": "credentials.json"
+  }
+}

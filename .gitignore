@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+*credentials*.json
+service_account.json
+appsetting.json
+.vscode/
