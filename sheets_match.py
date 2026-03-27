@@ -12,14 +12,15 @@ from typing import Any
 import gspread
 import pandas as pd
 from google.oauth2.service_account import Credentials
+from gspread import Cell
 from thefuzz import fuzz
 
 from text_normalize import normalize_for_match
 
-# 讀取試算表所需範圍（可依需求改為 readonly）
+# Google Sheets 讀寫所需範圍
 GSPREAD_SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets.readonly",
-    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
 ]
 
 DEFAULT_SHEET_URL = (
@@ -65,6 +66,83 @@ def open_gspread_client(service_account_path: str) -> gspread.Client:
         scopes=GSPREAD_SCOPES,
     )
     return gspread.authorize(creds)
+
+
+def write_order_values_to_sheet_row(
+    service_account_path: str,
+    spreadsheet_id: str,
+    worksheet_name: str,
+    sheet_row: int,
+    header_index_1based: dict[str, int],
+    buyer_account: str,
+    sale_price: float | int,
+    fee_value: float | int,
+) -> None:
+    """
+    以動態欄位索引將單筆訂單寫入指定列。
+
+    寫入欄位：
+    - 平台 -> 蝦皮
+    - 買家 -> 買家帳號
+    - 賣場售價 -> 商品原價
+    - 賣場手續費 -> 單件實扣手續費
+    """
+    required = ("平台", "買家", "賣場售價", "賣場手續費")
+    miss = [k for k in required if k not in header_index_1based]
+    if miss:
+        raise ValueError(f"欄位索引缺少：{', '.join(miss)}")
+
+    gc = open_gspread_client(service_account_path)
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = sh.worksheet(worksheet_name)
+
+    cells = [
+        Cell(sheet_row, int(header_index_1based["平台"]), "蝦皮"),
+        Cell(sheet_row, int(header_index_1based["買家"]), str(buyer_account or "")),
+        Cell(sheet_row, int(header_index_1based["賣場售價"]), str(sale_price)),
+        Cell(sheet_row, int(header_index_1based["賣場手續費"]), str(fee_value)),
+    ]
+    ws.update_cells(cells, value_input_option="USER_ENTERED")
+
+
+def get_row_values_by_columns(
+    service_account_path: str,
+    spreadsheet_id: str,
+    worksheet_name: str,
+    sheet_row: int,
+    header_index_1based: dict[str, int],
+    columns: list[str],
+) -> dict[str, str]:
+    """讀取指定列、指定欄位目前值。"""
+    gc = open_gspread_client(service_account_path)
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = sh.worksheet(worksheet_name)
+    out: dict[str, str] = {}
+    for col in columns:
+        idx = int(header_index_1based[col])
+        out[col] = str(ws.cell(int(sheet_row), idx).value or "")
+    return out
+
+
+def update_row_values_by_columns(
+    service_account_path: str,
+    spreadsheet_id: str,
+    worksheet_name: str,
+    sheet_row: int,
+    header_index_1based: dict[str, int],
+    values_by_col: dict[str, str | int | float],
+) -> None:
+    """依動態欄位索引批次更新指定列。"""
+    gc = open_gspread_client(service_account_path)
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = sh.worksheet(worksheet_name)
+    cells: list[Cell] = []
+    for col, val in values_by_col.items():
+        if col not in header_index_1based:
+            continue
+        cells.append(Cell(int(sheet_row), int(header_index_1based[col]), str(val)))
+    if cells:
+        ws.update_cells(cells, value_input_option="USER_ENTERED")
 
 
 def fetch_worksheet_catalog(
@@ -139,6 +217,12 @@ def platform_passes_filter(platform_cell: Any, stock_tag: str) -> bool:
 
 
 def filter_catalog_for_stock_tag(catalog: pd.DataFrame, stock_tag: str) -> pd.DataFrame:
+    """相容舊名稱：回傳此訂單可參與比對的候選資料池。"""
+    return candidate_pool_for_stock_tag(catalog, stock_tag)
+
+
+def candidate_pool_for_stock_tag(catalog: pd.DataFrame, stock_tag: str) -> pd.DataFrame:
+    """模糊比對前的唯一候選池（Single Source of Truth）。"""
     if catalog.empty:
         return catalog
     mask = catalog["平台"].apply(lambda x: platform_passes_filter(x, stock_tag))

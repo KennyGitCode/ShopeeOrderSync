@@ -4,3 +4,4 @@ opencc-python-reimplemented>=0.1.7
 gspread>=6.0.0
 google-auth>=2.0.0
 thefuzz>=0.22.0
+zhconv
