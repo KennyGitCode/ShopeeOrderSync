@@ -23,6 +23,7 @@ HISTORY_HEADERS = [
     "Orig_Price",
     "Orig_Fee",
     "Last_Hint",
+    "Raw_Name",
 ]
 
 
@@ -49,8 +50,8 @@ def ensure_history_worksheet(service_account_path: str, spreadsheet_id: str):
     except Exception:
         ws = sh.add_worksheet(title=HISTORY_SHEET_NAME, rows=2000, cols=20)
     first = ws.row_values(1)
-    if [str(x).strip() for x in first] != HISTORY_HEADERS:
-        ws.update("A1:K1", [HISTORY_HEADERS])
+    if [str(x).strip() for x in first[: len(HISTORY_HEADERS)]] != HISTORY_HEADERS:
+        ws.update("A1:L1", [HISTORY_HEADERS], value_input_option="USER_ENTERED")
     return ws
 
 
@@ -66,6 +67,7 @@ def append_history_action(
     target_row: int | None,
     original_data: dict[str, str] | None,
     last_hint: str,
+    raw_name: str = "",
 ) -> None:
     ws = ensure_history_worksheet(service_account_path, spreadsheet_id)
     orig = original_data or {}
@@ -82,9 +84,43 @@ def append_history_action(
             str(orig.get("賣場售價", "")),
             str(orig.get("賣場手續費", "")),
             last_hint,
+            str(raw_name or ""),
         ],
         value_input_option="USER_ENTERED",
     )
+
+
+def append_history_actions_batch(
+    service_account_path: str,
+    spreadsheet_id: str,
+    actions: list[dict[str, Any]],
+) -> int:
+    """一次 append 多筆歷史動作，回傳實際寫入筆數。"""
+    if not actions:
+        return 0
+    ws = ensure_history_worksheet(service_account_path, spreadsheet_id)
+    rows: list[list[str]] = []
+    for a in actions:
+        orig = dict(a.get("original_data") or {})
+        tr = a.get("target_row")
+        rows.append(
+            [
+                str(a.get("batch_id", "") or ""),
+                str(a.get("upload_time", "") or ""),
+                str(a.get("filename", "") or ""),
+                str(a.get("order_uid", "") or ""),
+                str(a.get("action_type", "") or ""),
+                "" if tr is None else str(int(tr)),
+                str(orig.get("平台", "")),
+                str(orig.get("買家", "")),
+                str(orig.get("賣場售價", "")),
+                str(orig.get("賣場手續費", "")),
+                str(a.get("last_hint", "") or ""),
+                str(a.get("raw_name", "") or ""),
+            ]
+        )
+    ws.append_rows(rows, value_input_option="USER_ENTERED")
+    return len(rows)
 
 
 def read_history_actions(service_account_path: str, spreadsheet_id: str) -> list[dict[str, Any]]:
@@ -120,6 +156,12 @@ def latest_uid_action_map(actions: list[dict[str, Any]]) -> dict[str, str]:
         if uid not in out or rn > out[uid][0]:
             out[uid] = (rn, t)
     return {uid: t for uid, (_, t) in out.items()}
+
+
+def processed_uids_from_actions(actions: list[dict[str, Any]]) -> set[str]:
+    """僅回傳目前有效狀態為 write 的 UID（rollback 後會自動消失）。"""
+    latest = latest_uid_action_map(actions)
+    return {uid for uid, act in latest.items() if act == "write"}
 
 
 def group_batches(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -202,8 +244,8 @@ def rollback_batch(
     spreadsheet_id: str,
     worksheet_name: str,
     batch_id: str,
-) -> tuple[int, int]:
-    """回傳 (restored_count, deleted_history_rows)。"""
+) -> tuple[int, int, list[str]]:
+    """回傳 (restored_count, deleted_history_rows, raw_names_for_dictionary_unlearn)。"""
     gc = open_gspread_client(service_account_path)
     sh = gc.open_by_key(spreadsheet_id)
     ws_target = sh.worksheet(worksheet_name)
@@ -211,16 +253,22 @@ def rollback_batch(
     actions = read_history_actions(service_account_path, spreadsheet_id)
     hits = [a for a in actions if str(a.get("Batch_ID", "")).strip() == batch_id]
     if not hits:
-        return 0, 0
+        return 0, 0, []
 
     hm = _target_header_map(ws_target)
     restored = 0
+    raw_for_unlearn: list[str] = []
+    seen_raw: set[str] = set()
     for a in hits:
         if str(a.get("Action_Type", "")).strip().lower() != "write":
             continue
         row = int(str(a.get("Target_Row", "0") or "0") or 0)
         if row <= 0:
             continue
+        rn = str(a.get("Raw_Name", "") or "").strip()
+        if rn and rn not in seen_raw:
+            seen_raw.add(rn)
+            raw_for_unlearn.append(rn)
         back = {
             "平台": str(a.get("Orig_Platform", "")),
             "買家": str(a.get("Orig_Buyer", "")),
@@ -238,7 +286,7 @@ def rollback_batch(
 
     del_rows = [int(a["_row_number"]) for a in hits]
     _delete_rows(ws_hist, del_rows)
-    return restored, len(del_rows)
+    return restored, len(del_rows), raw_for_unlearn
 
 
 def gc_keep_latest_batches(service_account_path: str, spreadsheet_id: str, keep: int = 5) -> int:

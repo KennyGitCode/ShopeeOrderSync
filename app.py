@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import codecs
 import hashlib
 import io
 import math
@@ -19,12 +18,20 @@ import streamlit as st
 import zhconv
 
 from app_settings import load_google_sheet_config
+from sku_dictionary import (
+    batch_learn_dictionary_entries,
+    batch_forget_dictionary_entries,
+    forget_dictionary_by_raw_name,
+    merged_standard_keyword_from_catalog_row,
+    read_dictionary_map,
+)
 from cloud_history import (
-    append_history_action,
+    append_history_actions_batch,
     completed_uids_from_actions,
     gc_keep_latest_batches,
     group_batches,
     latest_uid_action_map,
+    processed_uids_from_actions,
     read_history_actions,
     rollback_batch,
     rollback_order_uid,
@@ -37,9 +44,9 @@ from sheets_match import (
     fuzzy_top3_matches,
     get_catalog_row_by_sheet_row,
     row_has_order_like_data,
-    get_row_values_by_columns,
-    write_order_values_to_sheet_row,
+    batch_write_order_values_to_sheet_rows,
 )
+from text_normalize import normalize_for_match
 
 # ---------------------------------------------------------------------------
 # 欄位與常數
@@ -56,123 +63,6 @@ REQUIRED_COLUMNS = [
     "商品選項名稱",
     "數量",
 ]
-
-# 自動偵測時嘗試順序（strict）：勿在 Big5 之前用 UTF-8 replace，
-# 否則 Big5 檔會被「錯誤的 UTF-8」解出而不拋錯，欄位變亂碼／。
-_CSV_ENCODING_TRY_ORDER: list[str] = [
-    "utf-8-sig",
-    "utf-8",
-    "big5",
-    "cp950",
-    "gb18030",
-    "gbk",
-    "big5hkscs",
-    "utf-16",
-    "utf-16-le",
-    "utf-16-be",
-]
-
-# 側邊欄手動選項（label, encoding 或 None=自動）
-MANUAL_ENCODING_OPTIONS: list[tuple[str, str | None]] = [
-    ("自動（比對必要欄位選最佳）", None),
-    ("UTF-8（含 BOM）", "utf-8-sig"),
-    ("UTF-8", "utf-8"),
-    ("Big5（台灣 Excel／蝦皮常見）", "big5"),
-    ("CP950", "cp950"),
-    ("GB18030", "gb18030"),
-    ("GBK", "gbk"),
-]
-
-
-def _csv_encoding_candidates() -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for name in _CSV_ENCODING_TRY_ORDER:
-        if name in seen:
-            continue
-        try:
-            codecs.lookup(name)
-        except LookupError:
-            continue
-        seen.add(name)
-        out.append(name)
-    return out
-
-
-def _read_csv_try(raw_bytes: bytes, encoding: str, errors: str) -> pd.DataFrame | None:
-    try:
-        return pd.read_csv(
-            io.BytesIO(raw_bytes),
-            encoding=encoding,
-            encoding_errors=errors,
-        )
-    except (
-        UnicodeError,
-        LookupError,
-        pd.errors.EmptyDataError,
-        pd.errors.ParserError,
-    ):
-        return None
-
-
-def _required_columns_match_score(df: pd.DataFrame) -> int:
-    return sum(1 for c in REQUIRED_COLUMNS if c in df.columns)
-
-
-def read_csv_bytes(
-    raw_bytes: bytes,
-    encoding_override: str | None = None,
-) -> pd.DataFrame:
-    """
-    讀取 CSV 位元組。
-
-    - **自動**：對多種編碼只用 `strict` 嘗試，並以「命中幾個必要欄位名」選最佳結果；
-      若仍無法找齊欄位，第二輪才對各編碼試 `replace`（給少數壞位元組的 UTF-8 檔用）。
-    - **手動**：依使用者指定編碼，先 strict 再 replace。
-
-    先前錯誤：在 UTF-8 strict 失敗後立刻用 UTF-8 replace，會讓 Big5 檔「成功」讀入但表頭全毀。
-    """
-    if encoding_override:
-        df = _read_csv_try(raw_bytes, encoding_override, "strict")
-        if df is None:
-            df = _read_csv_try(raw_bytes, encoding_override, "replace")
-        if df is None:
-            raise UnicodeDecodeError(
-                encoding_override, b"", 0, 1, "無法以此編碼解析 CSV"
-            )
-        return df
-
-    candidates = _csv_encoding_candidates()
-    best_df: pd.DataFrame | None = None
-    best_score = -1
-    best_pri = 10**9
-
-    def consider(df: pd.DataFrame | None, pri: int) -> None:
-        nonlocal best_df, best_score, best_pri
-        if df is None:
-            return
-        sc = _required_columns_match_score(df)
-        if sc > best_score or (sc == best_score and pri < best_pri):
-            best_score = sc
-            best_pri = pri
-            best_df = df
-
-    for pri, enc in enumerate(candidates):
-        consider(_read_csv_try(raw_bytes, enc, "strict"), pri)
-
-    if best_score == len(REQUIRED_COLUMNS) and best_df is not None:
-        return best_df
-
-    for pri, enc in enumerate(candidates):
-        consider(_read_csv_try(raw_bytes, enc, "replace"), pri)
-
-    if best_df is not None:
-        return best_df
-
-    raise UnicodeDecodeError("utf-8", b"", 0, 1, "無法以常見編碼解析 CSV")
-
-from text_normalize import normalize_for_match
-
 
 def clean_name_for_simplified(text: str) -> str:
     """與 `text_normalize.normalize_for_match` 相同，供階段一產出 `清洗後簡體名稱`。"""
@@ -514,11 +404,19 @@ def process_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict], pd.Se
     ]
 
     df_exp["清洗後簡體名稱"] = df_exp["合併原始名稱"].apply(clean_name_for_simplified)
-    # 絕對唯一識別碼：所有狀態追蹤均以 uid 為準
+    # 確定性 UID：同訂單/買家/商品名稱在不同批次重上傳仍得到相同識別
     df_exp = df_exp.reset_index(drop=True)
+    key_series = (
+        df_exp["訂單編號"].fillna("").astype(str).str.strip()
+        + "||"
+        + df_exp["買家帳號"].fillna("").astype(str).str.strip()
+        + "||"
+        + df_exp["合併原始名稱"].fillna("").astype(str).str.strip()
+    )
+    part = key_series.groupby(key_series, sort=False).cumcount()
     df_exp["uid"] = [
-        f"{str(order_no)}_{i}"
-        for i, order_no in enumerate(df_exp["訂單編號"].fillna("UNKNOWN"))
+        hashlib.sha256(f"{k}||{int(p)}".encode("utf-8")).hexdigest()[:20]
+        for k, p in zip(key_series, part)
     ]
 
     validation_issues = validate_processed_data(
@@ -531,37 +429,113 @@ def process_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict], pd.Se
     return df_exp, validation_issues, order_total_fees
 
 
-def _build_sheet_pick_options(
-    query_simplified: str, filtered: pd.DataFrame
+def _get_sku_dictionary_map(cred_path: str, spreadsheet_id: str) -> dict[str, str]:
+    """雲端商品字典；session 快取，手動同步時標記 dirty 重讀。"""
+    if not spreadsheet_id or not cred_path:
+        return {}
+    scope = spreadsheet_id
+    if (
+        st.session_state.get("sku_dictionary_scope") == scope
+        and not st.session_state.get("sku_dictionary_dirty", False)
+        and isinstance(st.session_state.get("sku_dictionary_cache"), dict)
+    ):
+        return dict(st.session_state["sku_dictionary_cache"])
+    m = read_dictionary_map(cred_path, spreadsheet_id)
+    st.session_state["sku_dictionary_cache"] = m
+    st.session_state["sku_dictionary_scope"] = scope
+    st.session_state["sku_dictionary_dirty"] = False
+    return m
+
+
+def _dict_hits_in_candidate_pool(
+    candidate_df: pd.DataFrame, keyword: str
+) -> list[tuple[int, pd.Series]]:
+    """候選池內含 Standard_Keyword 的列（原文或正規化子字串）。"""
+    kw = (keyword or "").strip()
+    if not kw or candidate_df.empty:
+        return []
+    kn = normalize_for_match(kw)
+    hits: list[tuple[int, pd.Series]] = []
+    seen: set[int] = set()
+    for _, row in candidate_df.iterrows():
+        sr = int(row.get("_sheet_row", 0) or 0)
+        if sr <= 0 or sr in seen:
+            continue
+        merged = str(row.get("_雲端合併比對字串", "") or "")
+        mn = normalize_for_match(merged)
+        if kw in merged or (kn and kn in mn):
+            seen.add(sr)
+            hits.append((sr, row))
+    hits.sort(key=lambda x: x[0])
+    return hits
+
+
+def _format_row_label_dict_hit(row: pd.Series) -> str:
+    pn = zhconv.convert(
+        str(row.get("品名", "") or "").replace("\n", " ").strip(), "zh-tw"
+    )
+    xi = zhconv.convert(
+        str(row.get("款式細項", "") or "").replace("\n", " ").strip(), "zh-tw"
+    )
+    sr = int(row.get("_sheet_row", 0) or 0)
+    return f"[✨ 字典命中] 第 {sr} 列 - {pn} {xi}".strip()
+
+
+def _build_top_pick_options(
+    raw_name: str,
+    query_simplified: str,
+    candidate_df: pd.DataFrame,
+    dict_map: dict[str, str],
 ) -> list[tuple[str, int | None]]:
-    """推薦列在前、略過在最後；預設 index=0 可直接選到最高分推薦。"""
+    """字典命中置頂，其餘 fuzzy 推薦，略過最後。"""
     opts: list[tuple[str, int | None]] = []
-    for sheet_row, score, merged in fuzzy_top3_matches(query_simplified, filtered):
+    raw_key = (raw_name or "").strip()
+    hit_rows: set[int] = set()
+    if raw_key in dict_map:
+        kw = dict_map[raw_key]
+        for sr, row in _dict_hits_in_candidate_pool(candidate_df, kw):
+            hit_rows.add(sr)
+            opts.append((_format_row_label_dict_hit(row), sr))
+    for sheet_row, score, merged in fuzzy_top3_matches(
+        query_simplified, candidate_df
+    ):
+        if sheet_row in hit_rows:
+            continue
         disp = zhconv.convert(merged.replace("\n", " "), "zh-tw")
         if len(disp) > 52:
             disp = disp[:52] + "…"
         opts.append(
-            (
-                f"第 {sheet_row} 列 · 相似度 {score} · {disp}",
-                sheet_row,
-            )
+            (f"第 {sheet_row} 列 · 相似度 {score} · {disp}", sheet_row)
         )
     opts.append(("略過不寫入", None))
     return opts
 
 
-def _build_candidate_pool_pick_options(
+def _build_all_pick_options(
     candidate_df: pd.DataFrame,
+    raw_name: str,
+    dict_map: dict[str, str],
     *,
     skip_first: bool,
 ) -> list[tuple[str, int | None]]:
-    """將候選池資料列轉成選單（完整品名+款式）。"""
+    """展開模式：略過後接字典命中，其餘候選池列依序。"""
     opts: list[tuple[str, int | None]] = []
+    raw_key = (raw_name or "").strip()
+    hit_rows: set[int] = set()
+    dict_labels: list[tuple[str, int]] = []
+    if raw_key in dict_map:
+        kw = dict_map[raw_key]
+        for sr, row in _dict_hits_in_candidate_pool(candidate_df, kw):
+            hit_rows.add(sr)
+            dict_labels.append((_format_row_label_dict_hit(row), sr))
     if skip_first:
         opts.append(("略過不寫入", None))
+        opts.extend(dict_labels)
+    else:
+        opts.extend(dict_labels)
     for _, row in candidate_df.iterrows():
         sheet_row = int(row.get("_sheet_row", 0) or 0)
-        if sheet_row <= 0:
+        if sheet_row <= 0 or sheet_row in hit_rows:
             continue
         pn = zhconv.convert(
             str(row.get("品名", "") or "").replace("\n", " ").strip(),
@@ -677,46 +651,180 @@ def _next_unfinished_uid(result_df: pd.DataFrame) -> str | None:
     return None
 
 
+def _session_write_skip_counts(result_df: pd.DataFrame) -> tuple[int, int]:
+    """依 session 完成的 done_type 統計寫入／略過筆數。"""
+    n_write = n_skip = 0
+    for pos, idx in enumerate(result_df.index):
+        uid = f"r_{pos}_{idx}"
+        dt = str(st.session_state.get(f"done_type_{uid}", "") or "").strip().lower()
+        if dt == "write":
+            n_write += 1
+        elif dt == "skip":
+            n_skip += 1
+    return n_write, n_skip
+
+
+def _staged_actions() -> list[dict]:
+    cur = st.session_state.get("staged_actions")
+    if isinstance(cur, list):
+        return list(cur)
+    return []
+
+
+def _set_staged_actions(actions: list[dict]) -> None:
+    st.session_state["staged_actions"] = list(actions)
+
+
+def _staged_map_by_uid(actions: list[dict]) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for a in actions:
+        uid = str(a.get("order_uid", "") or "").strip()
+        if uid:
+            out[uid] = a
+    return out
+
+
+def _revert_optimistic_action(action: dict) -> None:
+    if str(action.get("action_type", "")).lower() == "write":
+        tr = int(action.get("target_row", 0) or 0)
+        before_local = dict(action.get("before_local") or {})
+        if tr > 0 and before_local:
+            _mutate_local_catalog_row(tr, before_local)
+    raw = str(action.get("raw_name", "") or "").strip()
+    prev = action.get("prev_dict_keyword")
+    if raw:
+        msku = dict(st.session_state.get("sku_dictionary_cache") or {})
+        if prev:
+            msku[raw] = str(prev)
+        else:
+            msku.pop(raw, None)
+        st.session_state["sku_dictionary_cache"] = msku
+
+
+def _apply_optimistic_action(action: dict) -> None:
+    if str(action.get("action_type", "")).lower() == "write":
+        tr = int(action.get("target_row", 0) or 0)
+        if tr > 0:
+            _mutate_local_catalog_row(
+                tr,
+                {
+                    "平台": "蝦皮",
+                    "買家": str(action.get("buyer_account", "") or ""),
+                    "賣場售價": str(action.get("sale_price", "") or ""),
+                    "賣場手續費": str(action.get("fee_value", "") or ""),
+                },
+            )
+    raw = str(action.get("raw_name", "") or "").strip()
+    std_kw = str(action.get("std_keyword", "") or "").strip()
+    if raw and std_kw:
+        msku = dict(st.session_state.get("sku_dictionary_cache") or {})
+        msku[raw] = std_kw
+        st.session_state["sku_dictionary_cache"] = msku
+
+
+def _build_batch_summary_df(
+    result: pd.DataFrame,
+    history_actions: list[dict],
+    active_batch_id: str,
+    history_detail_map: dict[str, dict[str, object]],
+) -> pd.DataFrame:
+    """當前批次結算明細（業務欄位）；優先使用雲端歷史該 Batch_ID 的紀錄。"""
+    uid_to_row = {str(r.get("uid", "")): r for _, r in result.iterrows()}
+    bid = (active_batch_id or "").strip()
+    batch_actions = (
+        [
+            a
+            for a in history_actions
+            if str(a.get("Batch_ID", "")).strip() == bid
+        ]
+        if bid
+        else []
+    )
+    rows: list[dict[str, str]] = []
+    if batch_actions:
+        for a in sorted(
+            batch_actions, key=lambda x: int(x.get("_row_number", 0) or 0)
+        ):
+            uid = str(a.get("Order_UID", "") or "")
+            r = uid_to_row.get(uid)
+            action = str(a.get("Action_Type", "")).strip().lower()
+            if action == "write":
+                動作 = "寫入雲端"
+                平台 = "蝦皮"
+                tr = str(a.get("Target_Row", "") or "").strip() or "-"
+            else:
+                動作 = "略過"
+                平台 = "-"
+                tr = "-"
+            buyer = (
+                str(r.get("買家帳號", "") or "-") if r is not None else "-"
+            )
+            raw_nm = str(a.get("Raw_Name", "") or "").strip()
+            if not raw_nm and r is not None:
+                raw_nm = str(r.get("合併原始名稱", "") or "")
+            rows.append(
+                {
+                    "處理動作": 動作,
+                    "平台": 平台,
+                    "買家": buyer,
+                    "商品原始名稱": raw_nm or "-",
+                    "寫入目標列": tr,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    for pos, idx in enumerate(result.index):
+        uid = f"r_{pos}_{idx}"
+        row = result.loc[idx]
+        row_uid = str(row.get("uid", ""))
+        dt = str(st.session_state.get(f"done_type_{uid}", "") or "").strip().lower()
+        if dt == "write":
+            動作 = "寫入雲端"
+            平台 = "蝦皮"
+            det = history_detail_map.get(row_uid, {})
+            trv = det.get("target_row")
+            if isinstance(trv, int) and trv > 0:
+                tr = str(trv)
+            else:
+                tr = "-"
+        elif dt == "skip":
+            動作 = "略過"
+            平台 = "-"
+            tr = "-"
+        else:
+            continue
+        rows.append(
+            {
+                "處理動作": 動作,
+                "平台": 平台,
+                "買家": str(row.get("買家帳號", "") or "-"),
+                "商品原始名稱": str(row.get("合併原始名稱", "") or "-"),
+                "寫入目標列": tr,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def main():
     st.set_page_config(page_title="蝦皮訂單預處理", layout="wide")
-    st.title("蝦皮訂單 → 預處理、對帳與 Google Sheet 比對")
-    st.caption(
-        "階段一：數量展開、整數手續費分攤（**單件實扣手續費**）、名稱清洗與驗證。"
-        "階段二：讀取 Google Sheet，以 **token_set_ratio** 模糊比對品名。"
-    )
+    st.title("📦 訂單入庫與雲端比對系統")
 
     with st.sidebar:
-        st.subheader("CSV 編碼")
-        enc_labels = [t[0] for t in MANUAL_ENCODING_OPTIONS]
-        enc_values = [t[1] for t in MANUAL_ENCODING_OPTIONS]
-        enc_idx = st.selectbox(
-            "若表頭顯示亂碼或提示缺欄位，請改選編碼",
-            range(len(enc_labels)),
-            format_func=lambda i: enc_labels[i],
-            index=0,
-        )
-        encoding_override = enc_values[enc_idx]
-
-        st.divider()
-        st.subheader("階段二 · Google Sheets")
+        st.subheader("Google Sheets")
         sheet_url, worksheet_name, cred_path, cfg_warn = load_google_sheet_config()
         st.caption("連線設定由專案目錄下的 **appsetting.json** 讀取。")
         st.caption(f"工作表：**{worksheet_name}**")
         if cfg_warn:
             st.warning(cfg_warn)
 
-    uploaded = st.file_uploader("上傳 CSV", type=["csv"])
+    st.info(
+        "💡 **上傳前置作業**：請先將蝦皮後台下載的 Excel 報表打開，"
+        "**另存新檔為 CSV 格式 (逗號分隔)**，再將 CSV 檔拖曳至下方上傳。"
+    )
+    uploaded = st.file_uploader("上傳 CSV", type=["csv"], key="uploaded_file")
 
     if uploaded is None:
-        st.info("請上傳包含指定欄位的蝦皮訂單 CSV。")
-        st.markdown(
-            "**必要欄位：** "
-            + "、".join(f"`{c}`" for c in REQUIRED_COLUMNS)
-        )
-        st.markdown(
-            "**編碼建議：** 蝦皮／Excel 在台灣匯出常為 **Big5**；"
-            "若用記事本另存請選 **UTF-8**。"
-        )
+        st.info("請上傳 CSV 檔案開始處理。")
         return
 
     # getvalue() 可重複讀取；避免只用 read() 後指標在結尾
@@ -724,28 +832,28 @@ def main():
     csv_name = getattr(uploaded, "name", "unknown.csv")
     csv_fp = _fingerprint_bytes(raw_bytes)
 
-    try:
-        df = read_csv_bytes(raw_bytes, encoding_override=encoding_override)
-    except UnicodeDecodeError:
-        st.error(
-            "無法解碼 CSV。請在左側將「CSV 編碼」改為 **Big5** 或 **UTF-8（含 BOM）** 後再試，"
-            "或用 Excel「另存新檔 → CSV UTF-8」後重新上傳。"
-        )
-        return
-    except Exception as e:
-        st.error(f"讀取 CSV 失敗：{e}")
+    df: pd.DataFrame | None = None
+    for enc in ("utf-8-sig", "utf-8", "big5"):
+        try:
+            df = pd.read_csv(
+                io.BytesIO(raw_bytes),
+                encoding=enc,
+                dtype=str,
+                keep_default_na=False,
+            )
+            break
+        except UnicodeDecodeError:
+            continue
+        except Exception as e:
+            st.error(f"讀取 CSV 失敗：{e}")
+            return
+    if df is None:
+        st.error("CSV 編碼無法辨識，請重新將 Excel 另存為 CSV（UTF-8）後再上傳。")
         return
 
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
-        st.error(
-            "缺少以下欄位（常因 **編碼錯誤** 導致表頭變亂碼，程式才對不到欄位名）："
-            + "、".join(f"`{m}`" for m in missing)
-        )
-        st.warning(
-            "請到左側 **CSV 編碼** 改選「**Big5（台灣 Excel／蝦皮常見）**」或「**UTF-8（含 BOM）**」後，"
-            "畫面會自動重新整理。"
-        )
+        st.error("CSV 欄位格式不符，缺少欄位：" + "、".join(f"`{m}`" for m in missing))
         st.dataframe(df.head(20), width="stretch")
         return
 
@@ -804,12 +912,29 @@ def main():
     # 雲端歷史狀態（⚙️系統歷史紀錄）
     history_actions: list[dict] = []
     completed_uids: set[str] = set()
+    processed_uids: set[str] = set()
     uid_action_map: dict[str, str] = {}
     batch_groups: list[dict] = []
+    if not isinstance(st.session_state.get("staged_actions"), list):
+        st.session_state["staged_actions"] = []
 
     can_history = bool(spreadsheet_id and not cloud_error)
     history_detail_map: dict[str, dict[str, object]] = {}
     history_scope_key = f"{spreadsheet_id}|{worksheet_name.strip()}|{cred_path}"
+    active_batch_id = ""
+    active_upload_time = ""
+    if can_history and spreadsheet_id:
+        batch_scope = f"{csv_name}|{csv_fp}|{spreadsheet_id}|{worksheet_name.strip()}"
+        prev_scope = st.session_state.get("active_batch_scope")
+        if prev_scope == batch_scope and st.session_state.get("active_batch_id"):
+            active_batch_id = str(st.session_state.get("active_batch_id"))
+            active_upload_time = str(st.session_state.get("active_upload_time") or _now_text())
+        else:
+            active_batch_id = _new_batch_id(csv_name)
+            active_upload_time = _now_text()
+            st.session_state["active_batch_scope"] = batch_scope
+            st.session_state["active_batch_id"] = active_batch_id
+            st.session_state["active_upload_time"] = active_upload_time
     force_history_sync = bool(st.session_state.get("force_history_sync", False))
     need_history_init = (
         ("initial_sync_done" not in st.session_state)
@@ -829,10 +954,12 @@ def main():
             else:
                 history_actions = list(st.session_state.get("history_actions_cache", []))
             completed_uids = completed_uids_from_actions(history_actions)
+            processed_uids = processed_uids_from_actions(history_actions)
             uid_action_map = latest_uid_action_map(history_actions)
             batch_groups = group_batches(history_actions)
             history_detail_map = _latest_history_detail_by_uid(history_actions)
             st.session_state["completed_uids"] = sorted(completed_uids)
+            st.session_state["processed_uids"] = sorted(processed_uids)
             gc_deleted = gc_keep_latest_batches(cred_path, spreadsheet_id, keep=5)
             if gc_deleted > 0:
                 st.info(f"歷史表已清理舊批次紀錄列 {gc_deleted} 筆（僅保留最近 5 批）。")
@@ -842,18 +969,85 @@ def main():
 
     with st.sidebar:
         st.divider()
-        st.subheader("系統控制台")
+        st.markdown("##### ☁️ 雲端同步")
         if st.button("🔄 從雲端同步最新狀態", key="history_sync_button"):
             st.session_state["force_history_sync"] = True
             st.session_state["force_catalog_sync"] = True
+            st.session_state["sku_dictionary_dirty"] = True
             _invalidate_cloud_catalog_cache()
             st.rerun()
-        latest_hint = _latest_last_hint(history_actions)
-        if latest_hint:
-            st.caption(f"上次做到：{latest_hint}")
-        else:
-            st.caption("上次做到：目前無可用紀錄")
+        st.divider()
+        st.markdown("##### 🛒 批次提交與進度管理")
+        staged_actions = _staged_actions()
+        st.caption(f"🛒 待提交佇列：共有 {len(staged_actions)} 筆動作等待寫入")
+        if st.button("🚀 一鍵同步至雲端", type="primary", key="staged_commit_button"):
+            if not staged_actions:
+                st.warning("目前沒有待提交動作。")
+            elif not can_history or not active_batch_id:
+                st.error("目前無法連線雲端歷史表，暫時不能提交。")
+            else:
+                try:
+                    writes = [
+                        a for a in staged_actions if str(a.get("action_type", "")).lower() == "write"
+                    ]
+                    write_ops = [
+                        {
+                            "sheet_row": int(a.get("target_row", 0) or 0),
+                            "header_index_1based": dict(a.get("header_index_1based") or {}),
+                            "buyer_account": str(a.get("buyer_account", "") or ""),
+                            "sale_price": a.get("sale_price", ""),
+                            "fee_value": a.get("fee_value", ""),
+                        }
+                        for a in writes
+                    ]
+                    batch_write_order_values_to_sheet_rows(
+                        cred_path,
+                        spreadsheet_id,
+                        worksheet_name.strip(),
+                        write_ops,
+                    )
+                    append_history_actions_batch(
+                        cred_path,
+                        spreadsheet_id,
+                        staged_actions,
+                    )
+                    dict_entries = [
+                        (str(a.get("raw_name", "") or ""), str(a.get("std_keyword", "") or ""))
+                        for a in writes
+                    ]
+                    if dict_entries:
+                        batch_learn_dictionary_entries(
+                            cred_path,
+                            spreadsheet_id,
+                            dict_entries,
+                        )
+                    gc_keep_latest_batches(cred_path, spreadsheet_id, keep=5)
+                    _set_staged_actions([])
+                    st.session_state["history_cache_dirty"] = True
+                    st.session_state["force_history_sync"] = True
+                    st.session_state["sku_dictionary_dirty"] = True
+                    st.balloons()
+                    st.success(f"✅ 已完成批次同步：{len(staged_actions)} 筆。")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"批次同步失敗：{e}")
+        if st.button("🗑️ 捨棄當前進度", key="staged_discard_button"):
+            for a in reversed(staged_actions):
+                _revert_optimistic_action(a)
+            _set_staged_actions([])
+            st.session_state["force_catalog_sync"] = True
+            st.session_state["force_history_sync"] = True
+            st.session_state["sku_dictionary_dirty"] = True
+            _invalidate_cloud_catalog_cache()
+            st.rerun()
+
+        st.divider()
         with st.expander("🕒 系統歷史與批次回溯", expanded=False):
+            latest_hint = _latest_last_hint(history_actions)
+            if latest_hint:
+                st.caption(f"上次進度：{latest_hint}")
+            else:
+                st.caption("尚無歷程提示。")
             if not batch_groups:
                 st.caption("目前沒有可回溯批次。")
             else:
@@ -871,14 +1065,29 @@ def main():
                 st.caption(f"Batch ID: `{selected_batch.get('batch_id','')}`")
                 if st.button("還原此批次資料", key="rollback_selected_batch"):
                     try:
-                        restored, deleted = rollback_batch(
+                        restored, deleted, raw_batch = rollback_batch(
                             cred_path,
                             spreadsheet_id,
                             worksheet_name.strip(),
                             selected_batch.get("batch_id", ""),
                         )
+                        if raw_batch:
+                            try:
+                                batch_forget_dictionary_entries(
+                                    cred_path, spreadsheet_id, raw_batch
+                                )
+                            except Exception:
+                                pass
+                            msku = dict(
+                                st.session_state.get("sku_dictionary_cache")
+                                or {}
+                            )
+                            for r in raw_batch:
+                                msku.pop(str(r).strip(), None)
+                            st.session_state["sku_dictionary_cache"] = msku
                         st.session_state["history_cache_dirty"] = True
                         st.session_state["force_catalog_sync"] = True
+                        st.session_state["sku_dictionary_dirty"] = True
                         _invalidate_cloud_catalog_cache()
                         st.success(f"✅ 已回溯批次：還原 {restored} 筆、刪除歷史列 {deleted} 筆。")
                         st.rerun()
@@ -897,34 +1106,39 @@ def main():
 
     # 預先建立每筆訂單的下拉選項
     review_meta: dict[str, dict] = {}
-    active_batch_id = ""
-    active_upload_time = ""
-    if can_history and spreadsheet_id:
-        batch_scope = f"{csv_name}|{csv_fp}|{spreadsheet_id}|{worksheet_name.strip()}"
-        prev_scope = st.session_state.get("active_batch_scope")
-        if prev_scope == batch_scope and st.session_state.get("active_batch_id"):
-            active_batch_id = str(st.session_state.get("active_batch_id"))
-            active_upload_time = str(st.session_state.get("active_upload_time") or _now_text())
-        else:
-            active_batch_id = _new_batch_id(csv_name)
-            active_upload_time = _now_text()
-            st.session_state["active_batch_scope"] = batch_scope
-            st.session_state["active_batch_id"] = active_batch_id
-            st.session_state["active_upload_time"] = active_upload_time
+
+    sku_dict_map: dict[str, str] = {}
+    if spreadsheet_id and cred_path and (not cloud_error) and os.path.isfile(cred_path):
+        try:
+            sku_dict_map = _get_sku_dictionary_map(cred_path, spreadsheet_id)
+        except Exception:
+            sku_dict_map = {}
+
+    staged_actions = _staged_actions()
+    staged_by_uid = _staged_map_by_uid(staged_actions)
 
     if cloud_df is not None and not cloud_df.empty:
         for pos, (idx, row) in enumerate(result.iterrows()):
             uid = f"r_{pos}_{idx}"
             row_uid = str(row.get("uid", ""))
-            st.session_state[f"done_{uid}"] = row_uid in completed_uids
-            st.session_state[f"done_type_{uid}"] = uid_action_map.get(row_uid, "")
+            staged = staged_by_uid.get(row_uid)
+            done_by_history = row_uid in completed_uids
+            if staged is not None:
+                st.session_state[f"done_{uid}"] = True
+                st.session_state[f"done_type_{uid}"] = str(staged.get("action_type", "")).lower()
+            else:
+                st.session_state[f"done_{uid}"] = done_by_history
+                st.session_state[f"done_type_{uid}"] = uid_action_map.get(row_uid, "")
             tag = str(row.get("現貨預定標記", "") or "")
             candidate_df = candidate_pool_for_stock_tag(cloud_df, tag)
             q = str(row.get("清洗後簡體名稱", "") or "")
+            raw_nm = str(row.get("合併原始名稱", "") or "").strip()
             review_meta[uid] = {
-                "top_options": _build_sheet_pick_options(q, candidate_df),
-                "all_options": _build_candidate_pool_pick_options(
-                    candidate_df, skip_first=True
+                "top_options": _build_top_pick_options(
+                    raw_nm, q, candidate_df, sku_dict_map
+                ),
+                "all_options": _build_all_pick_options(
+                    candidate_df, raw_nm, sku_dict_map, skip_first=True
                 ),
                 "row": row,
                 "pos": pos,
@@ -934,24 +1148,60 @@ def main():
 
     for pos, (idx, row) in enumerate(result.iterrows()):
         uid = f"r_{pos}_{idx}"
+        row_uid = str(row.get("uid", ""))
+        staged_action = staged_by_uid.get(row_uid)
+        is_processed_lock = row_uid in processed_uids and staged_action is None
         done_key = f"done_{uid}"
         done = bool(st.session_state.get(done_key, False))
         done_type = str(st.session_state.get(f"done_type_{uid}", "") or "")
-        if show_only_pending and done:
+        if show_only_pending and (done or is_processed_lock):
             continue
         buyer = row.get("買家帳號", "")
         tag = row.get("現貨預定標記", "")
         price = row.get("商品原價", "")
-        if done_type == "skip":
+        if is_processed_lock:
+            done_mark = " [🔒 已於先前批次完成]"
+        elif done_type == "skip":
             done_mark = " [⏭ 已略過]"
+        elif staged_action is not None:
+            done_mark = " [🛒 已暫存]"
         else:
             done_mark = " [✅ 已完成]" if done else ""
         title = f"{buyer} ｜ {tag} ｜ 商品原價：{price}{done_mark}"
-        expanded_by_default = (not done) and (uid == next_uid)
+        expanded_by_default = (not done) and (not is_processed_lock) and (uid == next_uid)
         with st.expander(title, expanded=expanded_by_default):
             merged_disp = str(row.get("合併原始名稱", "") or "")
             fee_int = int(row.get("單件實扣手續費", 0) or 0)
             row_uid = str(row.get("uid", ""))
+
+            if is_processed_lock:
+                st.success("✅ 此訂單已於先前的批次同步完成，系統已自動鎖定保護。")
+                st.info(merged_disp)
+                st.metric("單件實扣手續費", f"{fee_int}")
+                continue
+
+            if staged_action is not None:
+                st.info("🛒 這筆已加入待提交佇列，尚未寫入雲端。")
+                if str(staged_action.get("action_type", "")).lower() == "skip":
+                    st.success("⏭️ 已暫存為略過。")
+                else:
+                    st.success(f"💾 已暫存寫入：第 {int(staged_action.get('target_row', 0) or 0)} 列。")
+                if st.button("↩️ 撤銷暫存", key=f"unstage_{uid}"):
+                    acts = _staged_actions()
+                    keep: list[dict] = []
+                    removed: dict | None = None
+                    for a in acts:
+                        if str(a.get("order_uid", "") or "") == row_uid and removed is None:
+                            removed = a
+                            continue
+                        keep.append(a)
+                    if removed is not None:
+                        _revert_optimistic_action(removed)
+                    _set_staged_actions(keep)
+                    st.session_state[done_key] = False
+                    st.session_state[f"done_type_{uid}"] = ""
+                    st.rerun()
+                continue
 
             if done:
                 if done_type == "skip":
@@ -996,6 +1246,26 @@ def main():
                                             "賣場手續費": hd.get("orig_fee", ""),
                                         },
                                     )
+                                raw_forget = str(
+                                    row.get("合併原始名稱", "") or ""
+                                ).strip()
+                                if spreadsheet_id and raw_forget:
+                                    try:
+                                        forget_dictionary_by_raw_name(
+                                            cred_path,
+                                            spreadsheet_id,
+                                            raw_forget,
+                                        )
+                                    except Exception:
+                                        pass
+                                    msku = dict(
+                                        st.session_state.get(
+                                            "sku_dictionary_cache"
+                                        )
+                                        or {}
+                                    )
+                                    msku.pop(raw_forget, None)
+                                    st.session_state["sku_dictionary_cache"] = msku
                             if restored:
                                 st.success("✅ 此筆已回溯並移除歷史紀錄。")
                             else:
@@ -1163,26 +1433,36 @@ def main():
                         f"{str(row.get('買家帳號','') or '')} "
                         f"(訂單: {str(row.get('訂單編號','') or '')})"
                     )
-                    append_history_action(
-                        cred_path,
-                        spreadsheet_id,
-                        batch_id=active_batch_id,
-                        upload_time=active_upload_time,
-                        filename=csv_name,
-                        order_uid=row_uid,
-                        action_type="skip",
-                        target_row=None,
-                        original_data=None,
-                        last_hint=hint,
+                    acts = _staged_actions()
+                    keep: list[dict] = []
+                    old: dict | None = None
+                    for a in acts:
+                        if str(a.get("order_uid", "") or "") == row_uid and old is None:
+                            old = a
+                            continue
+                        keep.append(a)
+                    if old is not None:
+                        _revert_optimistic_action(old)
+                    keep.append(
+                        {
+                            "batch_id": active_batch_id,
+                            "upload_time": active_upload_time,
+                            "filename": csv_name,
+                            "order_uid": row_uid,
+                            "action_type": "skip",
+                            "target_row": None,
+                            "original_data": None,
+                            "last_hint": hint,
+                            "raw_name": str(row.get("合併原始名稱", "") or ""),
+                        }
                     )
-                    gc_keep_latest_batches(cred_path, spreadsheet_id, keep=5)
+                    _set_staged_actions(keep)
                     st.session_state[done_key] = True
                     st.session_state[f"done_type_{uid}"] = "skip"
-                    st.session_state["history_cache_dirty"] = True
-                    st.success("已標記為略過。")
+                    st.success("已加入待提交佇列（略過）。")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"標記略過失敗：{e}")
+                    st.error(f"暫存略過失敗：{e}")
 
             if clicked_action and action_kind == "write":
                 if not can_history or not active_batch_id:
@@ -1193,86 +1473,180 @@ def main():
                     continue
                 try:
                     header_map = dict(r_target.get("_header_index_1based", {}) or {})
-                    cols4 = ["平台", "買家", "賣場售價", "賣場手續費"]
-                    # 即時交易安全：點擊當下重新讀取雲端欄位，防止他人剛更新同列而被覆蓋。
-                    preview_vals = {
+                    before_vals = {
                         "平台": str(r_target.get("平台", "") or ""),
                         "買家": str(r_target.get("買家", "") or ""),
                         "賣場售價": str(r_target.get("賣場售價", "") or ""),
                         "賣場手續費": str(r_target.get("賣場手續費", "") or ""),
                     }
-                    before_vals = get_row_values_by_columns(
-                        service_account_path=cred_path,
-                        spreadsheet_id=spreadsheet_id,
-                        worksheet_name=worksheet_name.strip(),
-                        sheet_row=int(eff_now),
-                        header_index_1based=header_map,
-                        columns=cols4,
-                    )
-                    if any(
-                        str(before_vals.get(k, "") or "").strip()
-                        != str(preview_vals.get(k, "") or "").strip()
-                        for k in cols4
-                    ):
-                        st.error(
-                            "此列雲端資料已在你操作期間被更新，已中止本次寫入。請先重新確認該列狀態後再提交。"
-                        )
-                        st.session_state["force_history_sync"] = True
-                        st.rerun()
-                    write_order_values_to_sheet_row(
-                        service_account_path=cred_path,
-                        spreadsheet_id=spreadsheet_id,
-                        worksheet_name=worksheet_name.strip(),
-                        sheet_row=int(eff_now),
-                        header_index_1based=header_map,
-                        buyer_account=str(row.get("買家帳號", "") or ""),
-                        sale_price=float(row.get("商品原價", 0) or 0),
-                        fee_value=int(row.get("單件實扣手續費", 0) or 0),
-                    )
                     hint = (
                         f"{str(row.get('訂單成立日期','') or '')} 的 "
                         f"{str(row.get('買家帳號','') or '')} "
                         f"(訂單: {str(row.get('訂單編號','') or '')})"
                     )
-                    append_history_action(
-                        cred_path,
-                        spreadsheet_id,
-                        batch_id=active_batch_id,
-                        upload_time=active_upload_time,
-                        filename=csv_name,
-                        order_uid=row_uid,
-                        action_type="write",
-                        target_row=int(eff_now),
-                        original_data=before_vals,
-                        last_hint=hint,
-                    )
-                    gc_keep_latest_batches(cred_path, spreadsheet_id, keep=5)
+                    raw_learn = str(row.get("合併原始名稱", "") or "").strip()
+                    std_kw = merged_standard_keyword_from_catalog_row(r_target)
+                    prev_dict_kw = str((st.session_state.get("sku_dictionary_cache") or {}).get(raw_learn, "") or "")
+                    new_action = {
+                        "batch_id": active_batch_id,
+                        "upload_time": active_upload_time,
+                        "filename": csv_name,
+                        "order_uid": row_uid,
+                        "action_type": "write",
+                        "target_row": int(eff_now),
+                        "original_data": before_vals,
+                        "last_hint": hint,
+                        "raw_name": raw_learn,
+                        "header_index_1based": header_map,
+                        "buyer_account": str(row.get("買家帳號", "") or ""),
+                        "sale_price": float(row.get("商品原價", 0) or 0),
+                        "fee_value": int(row.get("單件實扣手續費", 0) or 0),
+                        "std_keyword": std_kw,
+                        "prev_dict_keyword": prev_dict_kw,
+                        "before_local": before_vals,
+                    }
+                    acts = _staged_actions()
+                    keep: list[dict] = []
+                    old: dict | None = None
+                    for a in acts:
+                        if str(a.get("order_uid", "") or "") == row_uid and old is None:
+                            old = a
+                            continue
+                        keep.append(a)
+                    if old is not None:
+                        _revert_optimistic_action(old)
+                    keep.append(new_action)
+                    _apply_optimistic_action(new_action)
+                    _set_staged_actions(keep)
                     st.session_state[done_key] = True
                     st.session_state[f"done_type_{uid}"] = "write"
-                    st.session_state["history_cache_dirty"] = True
-                    _mutate_local_catalog_row(
-                        int(eff_now),
-                        {
-                            "平台": "蝦皮",
-                            "買家": str(row.get("買家帳號", "") or ""),
-                            "賣場售價": str(float(row.get("商品原價", 0) or 0)),
-                            "賣場手續費": str(int(row.get("單件實扣手續費", 0) or 0)),
-                        },
-                    )
-                    st.success("✅ 已成功寫入雲端表單！")
+                    st.success("✅ 已加入待提交佇列（寫入）。")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"寫入失敗：{e}")
+                    st.error(f"暫存寫入失敗：{e}")
 
     # 本次完成進度（session 級）
     total_cards = len(result)
-    done_count = sum(
+    committed_count = sum(
         1
-        for pos, idx in enumerate(result.index)
-        if st.session_state.get(f"done_r_{pos}_{idx}", False)
+        for _, row in result.iterrows()
+        if str(row.get("uid", "") or "") in completed_uids
     )
-    st.progress(0 if total_cards == 0 else done_count / total_cards)
-    st.caption(f"本次處理進度：{done_count}/{total_cards} 筆已完成")
+    staged_count = len(_staged_actions())
+    st.progress(0 if total_cards == 0 else committed_count / total_cards)
+    st.caption(
+        f"本次處理進度：已提交 {committed_count}/{total_cards} 筆"
+        + (f"（另有 {staged_count} 筆待提交）" if staged_count else "")
+    )
+
+    all_done = total_cards > 0 and committed_count >= total_cards and staged_count == 0
+    if all_done:
+        celeb_key = f"batch_done_balloons_{csv_fp}_{active_batch_id or 'na'}"
+        if not st.session_state.get(celeb_key, False):
+            st.balloons()
+            st.session_state[celeb_key] = True
+        st.success("🎉 本批次所有訂單皆已處理完畢！")
+        n_write, n_skip = _session_write_skip_counts(result)
+        bid = (active_batch_id or "").strip()
+        if bid and history_actions:
+            batch_rows = [
+                a
+                for a in history_actions
+                if str(a.get("Batch_ID", "")).strip() == bid
+            ]
+            if batch_rows:
+                n_write = sum(
+                    1
+                    for a in batch_rows
+                    if str(a.get("Action_Type", "")).strip().lower() == "write"
+                )
+                n_skip = sum(
+                    1
+                    for a in batch_rows
+                    if str(a.get("Action_Type", "")).strip().lower() == "skip"
+                )
+        mc1, mc2, mc3 = st.columns(3)
+        mc1.metric("總訂單數", total_cards)
+        mc2.metric("成功寫入", n_write)
+        mc3.metric("略過", n_skip)
+        summary_df = _build_batch_summary_df(
+            result, history_actions, active_batch_id, history_detail_map
+        )
+        if not summary_df.empty:
+            st.markdown("##### 📋 本批次成效明細")
+            st.dataframe(
+                summary_df,
+                hide_index=True,
+                width="stretch",
+            )
+            report_csv = summary_df.to_csv(index=False).encode("utf-8-sig")
+            safe_fn = "".join(
+                c if c.isalnum() or c in "._-" else "_" for c in (active_batch_id or csv_name)
+            )[:72]
+            st.download_button(
+                label="下載批次結算報告 (CSV)",
+                data=report_csv,
+                file_name=f"batch_summary_{safe_fn}.csv",
+                mime="text/csv",
+                key="download_batch_summary_csv",
+            )
+
+        if st.button("🔄 處理下一份報表 (清除目前畫面)", type="primary"):
+            # Graceful Reset：只清「本批次」相關的 UI/進度狀態，保留雲端目錄與商品字典快取
+            keep_keys = {
+                "cloud_catalog_df",
+                "cloud_catalog_scope",
+                "sku_dictionary_cache",
+                "sku_dictionary_scope",
+                "sku_dictionary_dirty",
+                # history cache keys（不是硬性禁止，但通常有助於速度）
+                "history_actions_cache",
+                "initial_sync_done",
+                "initial_sync_scope",
+                "completed_uids",
+            }
+
+            clear_prefixes = (
+                "done_r_",
+                "done_type_r_",
+                "manual_override_r_",
+                "manual_row_r_",
+                "show_all_available_r_",
+                "show_all_available_mode_r_",
+                "cloud_sel_r_",
+                "force_write_r_",
+                "action_btn_r_",
+                "rollback_one_r_",
+                "batch_done_balloons_",
+                "unstage_r_",
+            )
+            clear_exact = {
+                # 當前批次識別與進度（本次流程結束後要回到乾淨畫面）
+                "active_batch_scope",
+                "active_batch_id",
+                "active_upload_time",
+                # 目前上傳檔
+                "uploaded_file",
+                # 逐筆審核/彙總 UI 的 widget 狀態
+                "show_only_pending",
+                "reset_done_flags",
+                "history_batch_pick",
+                "download_batch_summary_csv",
+                "staged_actions",
+                "staged_commit_button",
+                "staged_discard_button",
+            }
+
+            for k in list(st.session_state.keys()):
+                if k in keep_keys:
+                    continue
+                if k in clear_exact:
+                    st.session_state.pop(k, None)
+                    continue
+                if k.startswith(clear_prefixes):
+                    st.session_state.pop(k, None)
+
+            st.rerun()
 
     if st.button("重置本次完成標記（不影響雲端資料）", key="reset_done_flags"):
         for pos, idx in enumerate(result.index):

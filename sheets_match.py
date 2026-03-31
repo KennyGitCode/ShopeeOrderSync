@@ -105,6 +105,52 @@ def write_order_values_to_sheet_row(
     ws.update_cells(cells, value_input_option="USER_ENTERED")
 
 
+def batch_write_order_values_to_sheet_rows(
+    service_account_path: str,
+    spreadsheet_id: str,
+    worksheet_name: str,
+    operations: list[dict[str, Any]],
+) -> int:
+    """
+    一次更新多筆訂單寫入（單次 update_cells）。
+
+    operations 每筆需包含：
+    - sheet_row: int
+    - header_index_1based: dict[str, int]
+    - buyer_account: str
+    - sale_price: float|int
+    - fee_value: float|int
+    """
+    if not operations:
+        return 0
+    gc = open_gspread_client(service_account_path)
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = sh.worksheet(worksheet_name)
+    cells: list[Cell] = []
+    n = 0
+    for op in operations:
+        hm = dict(op.get("header_index_1based") or {})
+        required = ("平台", "買家", "賣場售價", "賣場手續費")
+        miss = [k for k in required if k not in hm]
+        if miss:
+            raise ValueError(f"欄位索引缺少：{', '.join(miss)}")
+        row = int(op.get("sheet_row", 0) or 0)
+        if row <= 0:
+            continue
+        cells.extend(
+            [
+                Cell(row, int(hm["平台"]), "蝦皮"),
+                Cell(row, int(hm["買家"]), str(op.get("buyer_account", "") or "")),
+                Cell(row, int(hm["賣場售價"]), str(op.get("sale_price", ""))),
+                Cell(row, int(hm["賣場手續費"]), str(op.get("fee_value", ""))),
+            ]
+        )
+        n += 1
+    if cells:
+        ws.update_cells(cells, value_input_option="USER_ENTERED")
+    return n
+
+
 def get_row_values_by_columns(
     service_account_path: str,
     spreadsheet_id: str,
