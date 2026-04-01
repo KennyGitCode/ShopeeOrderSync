@@ -7,3 +7,4 @@ service_account.json
 appsetting.json
 .vscode/
 sync_history.json
+last_processed.json
