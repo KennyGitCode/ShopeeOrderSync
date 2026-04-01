@@ -37,8 +37,10 @@ from cloud_history import (
     latest_written_order_created_date,
     processed_uids_from_actions,
     read_history_actions,
+    read_setting_value,
     rollback_batch,
     rollback_order_uid,
+    write_setting_value,
 )
 from sheets_match import (
     SHEET_FIRST_DATA_ROW_1BASED,
@@ -1081,9 +1083,25 @@ def main():
 
     all_parsed_orders = result.copy()
     if "system_cutoff_date" not in st.session_state:
-        st.session_state["system_cutoff_date"] = datetime.strptime(
-            suggest_start, "%Y-%m-%d"
-        ).date()
+        st.session_state["system_cutoff_date"] = datetime.strptime(suggest_start, "%Y-%m-%d").date()
+    # 跨電腦同步：從雲端設定表讀取接管日（僅首次載入該 scope）
+    cutoff_scope = f"{spreadsheet_id}|{worksheet_name.strip()}|{cred_path}"
+    if (
+        spreadsheet_id
+        and os.path.isfile(cred_path)
+        and st.session_state.get("cutoff_loaded_scope") != cutoff_scope
+    ):
+        try:
+            v = read_setting_value(
+                cred_path,
+                spreadsheet_id,
+                key="system_cutoff_date",
+            )
+            if v:
+                st.session_state["system_cutoff_date"] = datetime.strptime(v, "%Y-%m-%d").date()
+        except Exception:
+            pass
+        st.session_state["cutoff_loaded_scope"] = cutoff_scope
     if "system_cutoff_date_picker" not in st.session_state:
         st.session_state["system_cutoff_date_picker"] = st.session_state["system_cutoff_date"]
     st.markdown("### 中控台")
@@ -1092,6 +1110,20 @@ def main():
         key="system_cutoff_date_picker",
     )
     st.session_state["system_cutoff_date"] = st.session_state["system_cutoff_date_picker"]
+    # 若接管日有變動，立即寫回雲端設定，讓公司/家裡兩台一致
+    if spreadsheet_id and os.path.isfile(cred_path):
+        cutoff_text = st.session_state["system_cutoff_date"].strftime("%Y-%m-%d")
+        if st.session_state.get("last_saved_cutoff_date") != cutoff_text:
+            try:
+                write_setting_value(
+                    cred_path,
+                    spreadsheet_id,
+                    key="system_cutoff_date",
+                    value=cutoff_text,
+                )
+                st.session_state["last_saved_cutoff_date"] = cutoff_text
+            except Exception:
+                pass
     with st.expander("📊 不確定接管日？展開雷達分析 (使用本次上傳的資料)", expanded=False):
         if cloud_df is None or cloud_df.empty:
             st.warning("目前尚未載入主表 Catalog，無法進行雷達分析。")

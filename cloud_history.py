@@ -11,6 +11,7 @@ from gspread import Cell
 from sheets_match import HEADER_ROW_IDX_0, open_gspread_client
 
 HISTORY_SHEET_NAME = "⚙️系統歷史紀錄"
+SETTINGS_SHEET_NAME = "⚙️系統設定"
 HISTORY_HEADERS = [
     "Batch_ID",
     "Upload_Time",
@@ -26,6 +27,7 @@ HISTORY_HEADERS = [
     "Raw_Name",
     "Order_Created_At",
 ]
+SETTINGS_HEADERS = ["Key", "Value"]
 
 
 def _parse_time(s: str) -> datetime:
@@ -54,6 +56,62 @@ def ensure_history_worksheet(service_account_path: str, spreadsheet_id: str):
     if [str(x).strip() for x in first[: len(HISTORY_HEADERS)]] != HISTORY_HEADERS:
         ws.update("A1:M1", [HISTORY_HEADERS], value_input_option="USER_ENTERED")
     return ws
+
+
+def ensure_settings_worksheet(service_account_path: str, spreadsheet_id: str):
+    gc = open_gspread_client(service_account_path)
+    sh = gc.open_by_key(spreadsheet_id)
+    try:
+        ws = sh.worksheet(SETTINGS_SHEET_NAME)
+    except Exception:
+        ws = sh.add_worksheet(title=SETTINGS_SHEET_NAME, rows=200, cols=6)
+    first = ws.row_values(1)
+    if [str(x).strip() for x in first[: len(SETTINGS_HEADERS)]] != SETTINGS_HEADERS:
+        ws.update("A1:B1", [SETTINGS_HEADERS], value_input_option="USER_ENTERED")
+    return ws
+
+
+def read_setting_value(
+    service_account_path: str,
+    spreadsheet_id: str,
+    key: str,
+) -> str:
+    ws = ensure_settings_worksheet(service_account_path, spreadsheet_id)
+    vals = ws.get_all_values()
+    if len(vals) <= 1:
+        return ""
+    k = str(key or "").strip()
+    if not k:
+        return ""
+    for row in vals[1:]:
+        cells = list(row) + ["", ""]
+        if str(cells[0]).strip() == k:
+            return str(cells[1]).strip()
+    return ""
+
+
+def write_setting_value(
+    service_account_path: str,
+    spreadsheet_id: str,
+    key: str,
+    value: str,
+) -> None:
+    ws = ensure_settings_worksheet(service_account_path, spreadsheet_id)
+    vals = ws.get_all_values()
+    k = str(key or "").strip()
+    v = str(value or "").strip()
+    if not k:
+        return
+    hit_row: int | None = None
+    for i, row in enumerate(vals[1:], start=2):
+        cells = list(row) + ["", ""]
+        if str(cells[0]).strip() == k:
+            hit_row = i
+            break
+    if hit_row is None:
+        ws.append_row([k, v], value_input_option="USER_ENTERED")
+    else:
+        ws.update(f"B{hit_row}", [[v]], value_input_option="USER_ENTERED")
 
 
 def append_history_action(
