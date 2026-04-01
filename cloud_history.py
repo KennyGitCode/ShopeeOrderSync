@@ -24,6 +24,7 @@ HISTORY_HEADERS = [
     "Orig_Fee",
     "Last_Hint",
     "Raw_Name",
+    "Order_Created_At",
 ]
 
 
@@ -51,7 +52,7 @@ def ensure_history_worksheet(service_account_path: str, spreadsheet_id: str):
         ws = sh.add_worksheet(title=HISTORY_SHEET_NAME, rows=2000, cols=20)
     first = ws.row_values(1)
     if [str(x).strip() for x in first[: len(HISTORY_HEADERS)]] != HISTORY_HEADERS:
-        ws.update("A1:L1", [HISTORY_HEADERS], value_input_option="USER_ENTERED")
+        ws.update("A1:M1", [HISTORY_HEADERS], value_input_option="USER_ENTERED")
     return ws
 
 
@@ -68,6 +69,7 @@ def append_history_action(
     original_data: dict[str, str] | None,
     last_hint: str,
     raw_name: str = "",
+    order_created_at: str = "",
 ) -> None:
     ws = ensure_history_worksheet(service_account_path, spreadsheet_id)
     orig = original_data or {}
@@ -85,6 +87,7 @@ def append_history_action(
             str(orig.get("賣場手續費", "")),
             last_hint,
             str(raw_name or ""),
+            str(order_created_at or ""),
         ],
         value_input_option="USER_ENTERED",
     )
@@ -117,10 +120,50 @@ def append_history_actions_batch(
                 str(orig.get("賣場手續費", "")),
                 str(a.get("last_hint", "") or ""),
                 str(a.get("raw_name", "") or ""),
+                str(a.get("order_created_at", "") or ""),
             ]
         )
     ws.append_rows(rows, value_input_option="USER_ENTERED")
     return len(rows)
+
+
+def _parse_order_created_at(text: str) -> datetime | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    s = raw.replace("T", " ").replace("/", "-")
+    fmts = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+        "%Y-%m-%d %p %I:%M:%S",
+        "%Y-%m-%d %p %I:%M",
+    ]
+    for fmt in fmts:
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            continue
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def latest_written_order_created_date(actions: list[dict[str, Any]]) -> str | None:
+    """回傳 write 動作中最新的訂單成立日期（YYYY-MM-DD），無資料則 None。"""
+    best: datetime | None = None
+    for a in actions:
+        if str(a.get("Action_Type", "")).strip().lower() != "write":
+            continue
+        dt = _parse_order_created_at(str(a.get("Order_Created_At", "") or ""))
+        if dt is None:
+            continue
+        if best is None or dt > best:
+            best = dt
+    if best is None:
+        return None
+    return best.strftime("%Y-%m-%d")
 
 
 def read_history_actions(service_account_path: str, spreadsheet_id: str) -> list[dict[str, Any]]:

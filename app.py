@@ -11,8 +11,11 @@ import hashlib
 import io
 import math
 import os
+import re
 from datetime import datetime
+from datetime import timedelta
 
+import msoffcrypto
 import pandas as pd
 import streamlit as st
 import zhconv
@@ -31,6 +34,7 @@ from cloud_history import (
     gc_keep_latest_batches,
     group_batches,
     latest_uid_action_map,
+    latest_written_order_created_date,
     processed_uids_from_actions,
     read_history_actions,
     rollback_batch,
@@ -67,6 +71,37 @@ REQUIRED_COLUMNS = [
 def clean_name_for_simplified(text: str) -> str:
     """與 `text_normalize.normalize_for_match` 相同，供階段一產出 `清洗後簡體名稱`。"""
     return normalize_for_match(text)
+
+
+def normalize_item_name(raw_name: str) -> str:
+    """顯示/寫入用：僅收斂空白，盡量保留原始文字。"""
+    s = str(raw_name or "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def normalize_item_name_key(raw_name: str) -> str:
+    """UID/比對用：去 emoji + 小寫，確保鍵值穩定。"""
+    s = normalize_item_name(raw_name)
+    s = re.sub(
+        r"[\U0001F000-\U0001FAFF\U00002700-\U000027BF\U000024C2-\U0001F251]",
+        "",
+        s,
+    )
+    return s.lower()
+
+
+def generate_order_uid(order_no: str, buyer: str, normalized_name: str, part: int) -> str:
+    key = (
+        str(order_no or "").strip()
+        + "||"
+        + str(buyer or "").strip()
+        + "||"
+        + str(normalized_name or "").strip()
+        + "||"
+        + str(int(part))
+    )
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:20]
 
 
 def classify_stock_type(product_name: str, option_name: str) -> str:
@@ -361,6 +396,29 @@ def _mutate_local_catalog_row(sheet_row: int, values_by_col: dict[str, object]) 
             cached.loc[mask, col] = "" if val is None else str(val)
 
 
+def _assign_deterministic_uids(df_exp: pd.DataFrame) -> pd.DataFrame:
+    out = df_exp.reset_index(drop=True).copy()
+    name_series = out["合併原始名稱"].fillna("").astype(str).map(normalize_item_name_key)
+    key_series = (
+        out["訂單編號"].fillna("").astype(str).str.strip()
+        + "||"
+        + out["買家帳號"].fillna("").astype(str).str.strip()
+        + "||"
+        + name_series
+    )
+    part = key_series.groupby(key_series, sort=False).cumcount()
+    out["uid"] = [
+        generate_order_uid(order_no, buyer, nm, int(p))
+        for order_no, buyer, nm, p in zip(
+            out["訂單編號"].fillna("").astype(str),
+            out["買家帳號"].fillna("").astype(str),
+            name_series,
+            part,
+        )
+    ]
+    return out
+
+
 def process_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict], pd.Series]:
     df = df.copy()
     # 僅保留需求欄位（若有多餘欄位）
@@ -387,15 +445,11 @@ def process_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict], pd.Se
         errors="ignore",
     )
 
-    # 合併原始名稱：抹除編碼殘留的問號（含全形），再收斂空白
+    # 合併原始名稱：保留可讀原文（僅收斂空白），避免過度簡化
     gn = df_exp["商品名稱"].fillna("").astype(str)
     go = df_exp["商品選項名稱"].fillna("").astype(str)
     merged = (gn + " " + go).str.replace(r"\s+", " ", regex=True).str.strip()
-    df_exp["合併原始名稱"] = (
-        merged.str.replace("?", "", regex=False)
-        .str.replace("？", "", regex=False)
-        .str.replace("\ufffd", "", regex=False)
-    )
+    df_exp["合併原始名稱"] = merged.map(normalize_item_name)
 
     # 現貨/預定/未知：使用「原始」商品名稱與選項（展開後仍與來源列相同）
     df_exp["現貨預定標記"] = [
@@ -405,19 +459,7 @@ def process_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict], pd.Se
 
     df_exp["清洗後簡體名稱"] = df_exp["合併原始名稱"].apply(clean_name_for_simplified)
     # 確定性 UID：同訂單/買家/商品名稱在不同批次重上傳仍得到相同識別
-    df_exp = df_exp.reset_index(drop=True)
-    key_series = (
-        df_exp["訂單編號"].fillna("").astype(str).str.strip()
-        + "||"
-        + df_exp["買家帳號"].fillna("").astype(str).str.strip()
-        + "||"
-        + df_exp["合併原始名稱"].fillna("").astype(str).str.strip()
-    )
-    part = key_series.groupby(key_series, sort=False).cumcount()
-    df_exp["uid"] = [
-        hashlib.sha256(f"{k}||{int(p)}".encode("utf-8")).hexdigest()[:20]
-        for k, p in zip(key_series, part)
-    ]
+    df_exp = _assign_deterministic_uids(df_exp)
 
     validation_issues = validate_processed_data(
         raw_df=df,
@@ -805,6 +847,59 @@ def _build_batch_summary_df(
     return pd.DataFrame(rows)
 
 
+def _money_to_int(value: object) -> int | None:
+    try:
+        if value is None:
+            return None
+        s = str(value).strip()
+        if not s:
+            return None
+        return int(round(float(s.replace(",", ""))))
+    except Exception:
+        return None
+
+
+def _read_uploaded_report_dataframe(
+    raw_bytes: bytes,
+    filename: str,
+    *,
+    password: str,
+) -> pd.DataFrame:
+    ext = os.path.splitext(str(filename or ""))[1].lower()
+    if ext == ".xlsx":
+        office = msoffcrypto.OfficeFile(io.BytesIO(raw_bytes))
+        office.load_key(password=password or "")
+        decrypted_file = io.BytesIO()
+        office.decrypt(decrypted_file)
+        decrypted_file.seek(0)
+        return pd.read_excel(
+            decrypted_file,
+            engine="openpyxl",
+            dtype=str,
+        ).fillna("")
+    for enc in ("utf-8-sig", "utf-8", "big5"):
+        try:
+            return pd.read_csv(
+                io.BytesIO(raw_bytes),
+                encoding=enc,
+                dtype=str,
+                keep_default_na=False,
+            )
+        except UnicodeDecodeError:
+            continue
+    raise UnicodeDecodeError("utf-8", b"", 0, 1, "檔案編碼無法辨識")
+
+
+def _to_date_text(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        return pd.to_datetime(raw, errors="coerce").strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
 def main():
     st.set_page_config(page_title="蝦皮訂單預處理", layout="wide")
     st.title("📦 訂單入庫與雲端比對系統")
@@ -817,38 +912,56 @@ def main():
         if cfg_warn:
             st.warning(cfg_warn)
 
+    spreadsheet_id = extract_spreadsheet_id(sheet_url)
+    watermark_last = None
+    if spreadsheet_id and os.path.isfile(cred_path):
+        try:
+            wm_actions = read_history_actions(cred_path, spreadsheet_id)
+            watermark_last = latest_written_order_created_date(wm_actions)
+        except Exception:
+            watermark_last = None
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    if watermark_last:
+        last_dt = datetime.strptime(watermark_last, "%Y-%m-%d")
+        suggest_start = (last_dt - timedelta(days=40)).strftime("%Y-%m-%d")
+        watermark_line1 = f"雲端最新一筆紀錄停留在：**{watermark_last}**"
+    else:
+        suggest_start = (datetime.now() - timedelta(days=40)).strftime("%Y-%m-%d")
+        watermark_line1 = "雲端最新一筆紀錄停留在：**尚無已同步寫入紀錄**"
+    st.markdown("### 對帳三步曲")
     st.info(
-        "💡 **上傳前置作業**：請先將蝦皮後台下載的 Excel 報表打開，"
-        "**另存新檔為 CSV 格式 (逗號分隔)**，再將 CSV 檔拖曳至下方上傳。"
+        "**📍 第一步：前往蝦皮匯出報表**\n"
+        f"* {watermark_line1}\n"
+        f"* 💡 **請匯出區間：{suggest_start} 至 {yesterday}**\n"
+        "* 操作提示：請在蝦皮後台將訂單狀態選為「已完成」，匯出上述區間的報表。"
+        "(註：系統已自動往前推 40 天防漏單，重複資料會自動剔除，請安心整包匯出)"
     )
-    uploaded = st.file_uploader("上傳 CSV", type=["csv"], key="uploaded_file")
+    st.markdown("**🔐 第二步：輸入報表解鎖密碼**")
+    shopee_password = st.text_input(
+        "蝦皮報表解鎖密碼 (預設手機末六碼)",
+        type="password",
+        value="請在此處填寫使用者的預設密碼",
+        key="shopee_password",
+    )
+    st.markdown("**📤 第三步：上傳報表檔案 (CSV / 加密 XLSX)**")
+    uploaded = st.file_uploader("上傳 CSV / XLSX", type=["csv", "xlsx"], key="uploaded_file")
 
     if uploaded is None:
-        st.info("請上傳 CSV 檔案開始處理。")
+        st.info("請完成第二步密碼確認後，於第三步上傳報表檔案。")
         return
 
     # getvalue() 可重複讀取；避免只用 read() 後指標在結尾
     raw_bytes = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
     csv_name = getattr(uploaded, "name", "unknown.csv")
     csv_fp = _fingerprint_bytes(raw_bytes)
-
-    df: pd.DataFrame | None = None
-    for enc in ("utf-8-sig", "utf-8", "big5"):
-        try:
-            df = pd.read_csv(
-                io.BytesIO(raw_bytes),
-                encoding=enc,
-                dtype=str,
-                keep_default_na=False,
-            )
-            break
-        except UnicodeDecodeError:
-            continue
-        except Exception as e:
-            st.error(f"讀取 CSV 失敗：{e}")
-            return
-    if df is None:
-        st.error("CSV 編碼無法辨識，請重新將 Excel 另存為 CSV（UTF-8）後再上傳。")
+    try:
+        df = _read_uploaded_report_dataframe(
+            raw_bytes,
+            csv_name,
+            password=shopee_password,
+        )
+    except Exception:
+        st.error("密碼錯誤或檔案無法解密，請確認第二步的密碼設定")
         return
 
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
@@ -881,7 +994,6 @@ def main():
     )
 
     # --- 階段二：載入雲端目錄（可快取；設定來自 appsetting.json）---
-    spreadsheet_id = extract_spreadsheet_id(sheet_url)
 
     cloud_df: pd.DataFrame | None = None
     cloud_error: str | None = None
@@ -967,21 +1079,183 @@ def main():
         except Exception as e:
             st.warning(f"⚠️ 讀取雲端歷史紀錄失敗：{e}")
 
+    all_parsed_orders = result.copy()
+    if "system_cutoff_date" not in st.session_state:
+        st.session_state["system_cutoff_date"] = datetime.strptime(
+            suggest_start, "%Y-%m-%d"
+        ).date()
+    if "system_cutoff_date_picker" not in st.session_state:
+        st.session_state["system_cutoff_date_picker"] = st.session_state["system_cutoff_date"]
+    st.markdown("### 中控台")
+    st.date_input(
+        "📅 決定系統接管日 (此日期之前的訂單將被直接封存)",
+        key="system_cutoff_date_picker",
+    )
+    st.session_state["system_cutoff_date"] = st.session_state["system_cutoff_date_picker"]
+    with st.expander("📊 不確定接管日？展開雷達分析 (使用本次上傳的資料)", expanded=False):
+        if cloud_df is None or cloud_df.empty:
+            st.warning("目前尚未載入主表 Catalog，無法進行雷達分析。")
+        else:
+            legacy_pool = cloud_df[
+                cloud_df["平台"].fillna("").astype(str).str.contains("蝦皮")
+            ].copy()
+            legacy_pool["__buyer"] = legacy_pool["買家"].fillna("").astype(str).str.strip()
+            legacy_pool["__price"] = legacy_pool["賣場售價"].map(_money_to_int)
+
+            radar_df = all_parsed_orders.copy()
+            radar_df["__date"] = radar_df["訂單成立日期"].map(_to_date_text)
+            radar_df["__buyer"] = radar_df["買家帳號"].fillna("").astype(str).str.strip()
+            radar_df["__price"] = radar_df["商品原價"].map(_money_to_int)
+            radar_df = radar_df[radar_df["__date"] != ""].copy()
+
+            hit_flags: list[bool] = []
+            for _, r in radar_df.iterrows():
+                buyer = str(r.get("__buyer", "") or "")
+                price = r.get("__price")
+                if not buyer:
+                    hit_flags.append(False)
+                    continue
+                cands = legacy_pool[legacy_pool["__buyer"] == buyer]
+                hit_idx = None
+                if not cands.empty and price is not None:
+                    mm = cands[cands["__price"].notna()].copy()
+                    if not mm.empty:
+                        mm["__delta"] = (mm["__price"].astype(int) - int(price)).abs()
+                        mm = mm.sort_values(["__delta", "_sheet_row"], ascending=[True, True])
+                        best = mm.iloc[0]
+                        if int(best["__delta"]) <= 1:
+                            hit_idx = best.name
+                if hit_idx is None and not cands.empty and price is None:
+                    hit_idx = cands.iloc[0].name
+                if hit_idx is not None:
+                    legacy_pool = legacy_pool.drop(index=hit_idx)
+                    hit_flags.append(True)
+                else:
+                    hit_flags.append(False)
+
+            radar_df["__hit"] = hit_flags
+            daily = (
+                radar_df.groupby("__date", sort=True)
+                .agg(
+                    csv_total=("uid", "count"),
+                    hit_count=("__hit", "sum"),
+                )
+                .reset_index()
+                .rename(columns={"__date": "日期"})
+            )
+            daily["未匹配數"] = daily["csv_total"] - daily["hit_count"]
+            daily["命中率"] = ((daily["hit_count"] / daily["csv_total"]) * 100.0).round(1)
+            daily = daily.sort_values("日期", ascending=True).reset_index(drop=True)
+            daily["前日命中率"] = daily["命中率"].shift(1)
+            daily["跌幅"] = (daily["前日命中率"] - daily["命中率"]).fillna(0.0)
+            drop_mask = (daily["跌幅"] > 40.0) & (daily["命中率"] < 50.0)
+            suspected_cutoff_date = None
+            hit_drop = daily[drop_mask]
+            if not hit_drop.empty:
+                suspected_cutoff_date = str(hit_drop.iloc[0]["日期"])
+            daily["指標"] = daily["命中率"].map(
+                lambda v: "🟢 高" if v >= 80 else ("🔴 低" if v < 50 else "🟡 中")
+            )
+            if suspected_cutoff_date:
+                daily.loc[daily["日期"] == suspected_cutoff_date, "指標"] = (
+                    daily.loc[daily["日期"] == suspected_cutoff_date, "指標"] + " ⚠️ 疑似斷層"
+                )
+            show_df = daily.rename(
+                columns={
+                    "csv_total": "CSV 總單數",
+                    "hit_count": "匹配成功數",
+                }
+            )[["日期", "CSV 總單數", "匹配成功數", "未匹配數", "命中率", "指標"]]
+            if suspected_cutoff_date:
+                st.error(
+                    "🕵️ **系統偵測發現斷層！**\n"
+                    f"資料顯示在 **{suspected_cutoff_date}** 這天，歷史記帳命中率發生了斷崖式下跌。\n"
+                    "💡 強烈建議您將主畫面的「系統接管日」設定為這一天 (或它的前/後一天)！"
+                )
+                if st.button("✨ 一鍵套用建議日期", key="apply_suspected_cutoff_date"):
+                    picked_date = datetime.strptime(
+                        suspected_cutoff_date, "%Y-%m-%d"
+                    ).date()
+                    st.session_state["system_cutoff_date"] = picked_date
+                    st.session_state["system_cutoff_date_picker"] = picked_date
+                    st.rerun()
+            st.dataframe(show_df, hide_index=True, width="stretch")
+
+    system_cutoff_date = st.session_state["system_cutoff_date"]
+    st.session_state["legacy_archive_actions"] = []
+    duplicate_idx: list[int] = []
+    legacy_archive_idx: list[int] = []
+    pending_idx: list[int] = []
+    legacy_archive_actions: list[dict] = []
+
+    for i, row in all_parsed_orders.iterrows():
+        row_uid = str(row.get("uid", "") or "")
+        if row_uid in completed_uids:
+            duplicate_idx.append(i)
+            continue
+
+        dt_txt = _to_date_text(row.get("訂單成立日期"))
+        is_legacy_archive = False
+        if dt_txt:
+            try:
+                row_dt = datetime.strptime(dt_txt, "%Y-%m-%d").date()
+                is_legacy_archive = row_dt < system_cutoff_date
+            except Exception:
+                is_legacy_archive = False
+        if is_legacy_archive:
+            legacy_archive_idx.append(i)
+            legacy_archive_actions.append(
+                {
+                    "batch_id": active_batch_id,
+                    "upload_time": active_upload_time,
+                    "filename": csv_name,
+                    "order_uid": row_uid,
+                    "action_type": "skip",
+                    "target_row": None,
+                    "original_data": None,
+                    "last_hint": (
+                        f"{str(row.get('訂單成立日期', '') or '')} 的 "
+                        f"{str(row.get('買家帳號', '') or '')} "
+                        f"(訂單: {str(row.get('訂單編號', '') or '')})"
+                    ),
+                    "raw_name": normalize_item_name(str(row.get("合併原始名稱", "") or "")),
+                    "order_created_at": str(row.get("訂單成立日期", "") or ""),
+                }
+            )
+            continue
+
+        pending_idx.append(i)
+
+    st.session_state["legacy_archive_actions"] = legacy_archive_actions
+    duplicate_orders = all_parsed_orders.loc[duplicate_idx].copy()
+    legacy_archive_orders = all_parsed_orders.loc[legacy_archive_idx].copy()
+    pending_orders = all_parsed_orders.loc[pending_idx].copy().reset_index(drop=True)
+
+    st.success("📥 報表讀取與智慧分流成功！")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("總訂單數", len(all_parsed_orders))
+    m2.metric("🛡️ 已在歷史紀錄", len(duplicate_orders))
+    m3.metric("📦 接管日前封存", len(legacy_archive_orders))
+    m4.metric("🚀 本次待處理新單", len(pending_orders))
+    if len(duplicate_orders) > 0 or len(legacy_archive_orders) > 0:
+        st.caption("歷史已處理與接管日前封存資料皆不顯示於下方卡片。")
+    result = pending_orders
+
     with st.sidebar:
-        st.divider()
-        st.markdown("##### ☁️ 雲端同步")
-        if st.button("🔄 從雲端同步最新狀態", key="history_sync_button"):
-            st.session_state["force_history_sync"] = True
-            st.session_state["force_catalog_sync"] = True
-            st.session_state["sku_dictionary_dirty"] = True
-            _invalidate_cloud_catalog_cache()
-            st.rerun()
-        st.divider()
         st.markdown("##### 🛒 批次提交與進度管理")
         staged_actions = _staged_actions()
-        st.caption(f"🛒 待提交佇列：共有 {len(staged_actions)} 筆動作等待寫入")
-        if st.button("🚀 一鍵同步至雲端", type="primary", key="staged_commit_button"):
-            if not staged_actions:
+        legacy_archive_actions = list(st.session_state.get("legacy_archive_actions") or [])
+        total_sync_count = len(staged_actions) + len(legacy_archive_actions)
+        st.caption(
+            f"🛒 待提交佇列：一般動作 {len(staged_actions)} 筆"
+            f"／接管日前封存 {len(legacy_archive_actions)} 筆"
+        )
+        if st.button(
+            f"🚀 一鍵同步至雲端 ({total_sync_count} 筆)",
+            type="primary",
+            key="staged_commit_button",
+        ):
+            if not staged_actions and not legacy_archive_actions:
                 st.warning("目前沒有待提交動作。")
             elif not can_history or not active_batch_id:
                 st.error("目前無法連線雲端歷史表，暫時不能提交。")
@@ -1009,7 +1283,7 @@ def main():
                     append_history_actions_batch(
                         cred_path,
                         spreadsheet_id,
-                        staged_actions,
+                        staged_actions + legacy_archive_actions,
                     )
                     dict_entries = [
                         (str(a.get("raw_name", "") or ""), str(a.get("std_keyword", "") or ""))
@@ -1023,18 +1297,28 @@ def main():
                         )
                     gc_keep_latest_batches(cred_path, spreadsheet_id, keep=5)
                     _set_staged_actions([])
+                    st.session_state["legacy_archive_actions"] = []
                     st.session_state["history_cache_dirty"] = True
                     st.session_state["force_history_sync"] = True
                     st.session_state["sku_dictionary_dirty"] = True
                     st.balloons()
-                    st.success(f"✅ 已完成批次同步：{len(staged_actions)} 筆。")
+                    st.success(
+                        "✅ 已完成批次同步："
+                        f"{len(staged_actions)} 筆一般動作，"
+                        f"{len(legacy_archive_actions)} 筆封存。"
+                    )
                     st.rerun()
                 except Exception as e:
                     st.error(f"批次同步失敗：{e}")
-        if st.button("🗑️ 捨棄當前進度", key="staged_discard_button"):
+        if st.button(
+            "🗑️ 清空暫存並重來",
+            key="staged_discard_button",
+            help="💡 僅清空本次網頁上點選的進度與接管日前封存項目，讓您重新操作。絕對不會刪除雲端 Google Sheet 上的既有資料。",
+        ):
             for a in reversed(staged_actions):
                 _revert_optimistic_action(a)
             _set_staged_actions([])
+            st.session_state["legacy_archive_actions"] = []
             st.session_state["force_catalog_sync"] = True
             st.session_state["force_history_sync"] = True
             st.session_state["sku_dictionary_dirty"] = True
@@ -1094,13 +1378,13 @@ def main():
                     except Exception as e:
                         st.error(f"回溯失敗：{e}")
 
-    st.subheader("逐筆審核")
+    st.subheader("逐筆審核（僅顯示新單）")
     show_only_pending = st.checkbox("只顯示未完成", value=False, key="show_only_pending")
     next_uid = _next_unfinished_uid(result)
     if next_uid:
         st.caption(f"下一筆待處理：`{next_uid}`")
     else:
-        st.caption("目前沒有待處理項目。")
+        st.caption("目前沒有待處理新單。")
     if cloud_df is None or cloud_df.empty:
         st.info("載入試算表後，此處將顯示每筆訂單與推薦雲端列、手動行號與寫入按鈕狀態。")
 
@@ -1150,35 +1434,26 @@ def main():
         uid = f"r_{pos}_{idx}"
         row_uid = str(row.get("uid", ""))
         staged_action = staged_by_uid.get(row_uid)
-        is_processed_lock = row_uid in processed_uids and staged_action is None
         done_key = f"done_{uid}"
         done = bool(st.session_state.get(done_key, False))
         done_type = str(st.session_state.get(f"done_type_{uid}", "") or "")
-        if show_only_pending and (done or is_processed_lock):
+        if show_only_pending and done:
             continue
         buyer = row.get("買家帳號", "")
         tag = row.get("現貨預定標記", "")
         price = row.get("商品原價", "")
-        if is_processed_lock:
-            done_mark = " [🔒 已於先前批次完成]"
-        elif done_type == "skip":
+        if done_type == "skip":
             done_mark = " [⏭ 已略過]"
         elif staged_action is not None:
             done_mark = " [🛒 已暫存]"
         else:
             done_mark = " [✅ 已完成]" if done else ""
         title = f"{buyer} ｜ {tag} ｜ 商品原價：{price}{done_mark}"
-        expanded_by_default = (not done) and (not is_processed_lock) and (uid == next_uid)
+        expanded_by_default = (not done) and (uid == next_uid)
         with st.expander(title, expanded=expanded_by_default):
             merged_disp = str(row.get("合併原始名稱", "") or "")
             fee_int = int(row.get("單件實扣手續費", 0) or 0)
             row_uid = str(row.get("uid", ""))
-
-            if is_processed_lock:
-                st.success("✅ 此訂單已於先前的批次同步完成，系統已自動鎖定保護。")
-                st.info(merged_disp)
-                st.metric("單件實扣手續費", f"{fee_int}")
-                continue
 
             if staged_action is not None:
                 st.info("🛒 這筆已加入待提交佇列，尚未寫入雲端。")
@@ -1454,6 +1729,7 @@ def main():
                             "original_data": None,
                             "last_hint": hint,
                             "raw_name": str(row.get("合併原始名稱", "") or ""),
+                            "order_created_at": str(row.get("訂單成立日期", "") or ""),
                         }
                     )
                     _set_staged_actions(keep)
@@ -1504,6 +1780,7 @@ def main():
                         "std_keyword": std_kw,
                         "prev_dict_keyword": prev_dict_kw,
                         "before_local": before_vals,
+                        "order_created_at": str(row.get("訂單成立日期", "") or ""),
                     }
                     acts = _staged_actions()
                     keep: list[dict] = []
