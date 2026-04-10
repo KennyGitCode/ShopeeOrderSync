@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import math
 import os
 import re
@@ -20,7 +21,12 @@ import pandas as pd
 import streamlit as st
 import zhconv
 
-from app_settings import load_google_sheet_config
+from app_settings import (
+    load_google_sheet_config,
+    load_google_sheet_profiles,
+    load_report_password_default,
+    save_active_google_sheet_profile,
+)
 from sku_dictionary import (
     batch_learn_dictionary_entries,
     batch_forget_dictionary_entries,
@@ -70,6 +76,9 @@ REQUIRED_COLUMNS = [
     "商品選項名稱",
     "數量",
 ]
+
+LOCAL_DRAFT_DIRNAME = ".cache"
+LOCAL_STAGED_DRAFT_FILENAME = "staged_actions_draft.json"
 
 def clean_name_for_simplified(text: str) -> str:
     """與 `text_normalize.normalize_for_match` 相同，供階段一產出 `清洗後簡體名稱`。"""
@@ -750,6 +759,65 @@ def _staged_actions() -> list[dict]:
 
 def _set_staged_actions(actions: list[dict]) -> None:
     st.session_state["staged_actions"] = list(actions)
+    scope = str(st.session_state.get("staged_draft_scope", "") or "").strip()
+    if scope:
+        _save_local_staged_draft(scope, list(actions))
+
+
+def _local_staged_draft_path() -> str:
+    draft_dir = os.path.join(os.path.dirname(__file__), LOCAL_DRAFT_DIRNAME)
+    os.makedirs(draft_dir, exist_ok=True)
+    return os.path.join(draft_dir, LOCAL_STAGED_DRAFT_FILENAME)
+
+
+def _read_all_local_staged_drafts() -> dict[str, list[dict]]:
+    p = _local_staged_draft_path()
+    if not os.path.isfile(p):
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except Exception:
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    out: dict[str, list[dict]] = {}
+    for k, v in obj.items():
+        key = str(k or "").strip()
+        if not key:
+            continue
+        if isinstance(v, list):
+            out[key] = [x for x in v if isinstance(x, dict)]
+    return out
+
+
+def _write_all_local_staged_drafts(drafts: dict[str, list[dict]]) -> None:
+    p = _local_staged_draft_path()
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(drafts, f, ensure_ascii=False, indent=2)
+
+
+def _load_local_staged_draft(scope: str) -> list[dict]:
+    key = str(scope or "").strip()
+    if not key:
+        return []
+    return list(_read_all_local_staged_drafts().get(key, []))
+
+
+def _save_local_staged_draft(scope: str, actions: list[dict]) -> None:
+    key = str(scope or "").strip()
+    if not key:
+        return
+    drafts = _read_all_local_staged_drafts()
+    if actions:
+        drafts[key] = [x for x in actions if isinstance(x, dict)]
+    else:
+        drafts.pop(key, None)
+    _write_all_local_staged_drafts(drafts)
+
+
+def _clear_local_staged_draft(scope: str) -> None:
+    _save_local_staged_draft(scope, [])
 
 
 def _staged_map_by_uid(actions: list[dict]) -> dict[str, dict]:
@@ -935,6 +1003,97 @@ def _to_date_text(value: object) -> str:
         return ""
 
 
+def _sheet_open_date_text(row: pd.Series | None) -> str:
+    """優先回傳雲端列上的開單日期（yyyy-mm-dd）；無可用值則回傳（未知）。"""
+    if row is None:
+        return "（未知）"
+    candidates = [
+        "開單日期",
+        "訂單成立日期",
+        "填單日期",
+        "填單時間",
+        "建立日期",
+        "建立時間",
+        "日期",
+    ]
+    for key in candidates:
+        raw = str(row.get(key, "") or "").strip()
+        dt = _to_date_text(raw)
+        if dt:
+            return dt
+    for key in row.index:
+        k = str(key or "").strip()
+        if ("日期" not in k) and ("時間" not in k):
+            continue
+        raw = str(row.get(key, "") or "").strip()
+        dt = _to_date_text(raw)
+        if dt:
+            return dt
+    return "（未知）"
+
+
+def _dict_fingerprint(m: dict[str, str]) -> str:
+    if not m:
+        return ""
+    pairs = [f"{k}=>{v}" for k, v in sorted((str(k), str(v)) for k, v in m.items())]
+    src = "\n".join(pairs)
+    return hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
+
+
+def _clear_review_runtime_state() -> None:
+    """切換 profile 時，清除本次審核/上傳狀態，避免不同表單交叉污染。"""
+    clear_prefixes = (
+        "done_r_",
+        "done_type_r_",
+        "manual_override_r_",
+        "manual_row_r_",
+        "show_all_available_r_",
+        "show_all_available_mode_r_",
+        "cloud_sel_r_",
+        "force_write_r_",
+        "action_btn_r_",
+        "rollback_one_r_",
+        "confirm_rollback_one_r_",
+        "batch_done_balloons_",
+        "unstage_r_",
+    )
+    clear_exact = {
+        "active_batch_scope",
+        "active_batch_id",
+        "active_upload_time",
+        "uploaded_file",
+        "show_only_pending",
+        "history_batch_pick",
+        "download_batch_summary_csv",
+        "staged_actions",
+        "baseline_completed_scope",
+        "baseline_completed_uids",
+        "local_synced_scope",
+        "local_synced_action_map",
+        "staged_draft_scope",
+        "staged_draft_loaded_scope",
+        "review_meta_scope",
+        "review_meta_cache",
+    }
+    for k in list(st.session_state.keys()):
+        if k in clear_exact or k.startswith(clear_prefixes):
+            st.session_state.pop(k, None)
+
+
+def _profile_display_name(profile_name: str) -> str:
+    p = str(profile_name or "").strip().lower()
+    if p in {"prod", "production"}:
+        return "正式"
+    if p in {"test", "testing"}:
+        return "測試"
+    return str(profile_name or "")
+
+
+def _mark_cutoff_dirty() -> None:
+    """僅在使用者手動調整接管日時，才標記需寫回雲端設定。"""
+    st.session_state["system_cutoff_dirty"] = True
+
+
 def _get_spreadsheet_title(service_account_path: str, spreadsheet_id: str) -> str:
     """讀取試算表文件名稱；失敗時回空字串。"""
     if not service_account_path or not spreadsheet_id or (not os.path.isfile(service_account_path)):
@@ -966,10 +1125,30 @@ def main():
 
     with st.sidebar:
         st.subheader("試算表連線")
-        sheet_url, worksheet_name, cred_path, cfg_warn = load_google_sheet_config()
+        profile_cfg, active_profile, cfg_warn = load_google_sheet_profiles()
+        profile_names = list(profile_cfg.keys())
+        default_idx = profile_names.index(active_profile) if active_profile in profile_names else 0
+        selected_profile = st.selectbox(
+            "環境",
+            options=profile_names,
+            index=default_idx,
+            key="sheet_profile",
+            format_func=_profile_display_name,
+        )
+        last_profile = str(st.session_state.get("sheet_profile_runtime", selected_profile))
+        if last_profile != selected_profile:
+            _clear_review_runtime_state()
+            save_err = save_active_google_sheet_profile(selected_profile)
+            if save_err:
+                st.warning(f"⚠️ 無法儲存預設環境：{save_err}")
+        st.session_state["sheet_profile_runtime"] = selected_profile
+        sheet_url, worksheet_name, cred_path, cfg_warn2 = load_google_sheet_config(selected_profile)
+        if cfg_warn2 and not cfg_warn:
+            cfg_warn = cfg_warn2
         sheet_id_for_caption = extract_spreadsheet_id(sheet_url) or ""
         sheet_title_for_caption = _get_spreadsheet_title(cred_path, sheet_id_for_caption)
         st.caption("連線設定由系統設定檔讀取。")
+        st.caption(f"目前環境：**{_profile_display_name(selected_profile)}**")
         if sheet_title_for_caption:
             st.caption(f"試算表：**{sheet_title_for_caption}**")
         elif sheet_id_for_caption:
@@ -1005,10 +1184,11 @@ def main():
             "(註：系統已自動往前推 40 天防漏單，重複資料會自動剔除，請安心整包匯出)"
         )
         st.markdown("**🔐 第二步：輸入報表解鎖密碼**")
+        pw_default = load_report_password_default() or "請在此處填寫使用者的預設密碼"
         shopee_password = st.text_input(
             "蝦皮報表解鎖密碼 (預設手機末六碼)",
             type="password",
-            value="請在此處填寫使用者的預設密碼",
+            value=pw_default,
             key="shopee_password",
         )
         st.markdown("**📤 第三步：上傳報表檔案 (CSV / 加密 XLSX)**")
@@ -1115,6 +1295,18 @@ def main():
             st.session_state["active_batch_id"] = active_batch_id
             st.session_state["active_upload_time"] = active_upload_time
     display_scope = f"{csv_name}|{csv_fp}|{spreadsheet_id}|{worksheet_name.strip()}"
+    draft_scope = f"{display_scope}|{cred_path}"
+    st.session_state["staged_draft_scope"] = draft_scope
+    if st.session_state.get("staged_draft_loaded_scope") != draft_scope:
+        restored_actions = _load_local_staged_draft(draft_scope)
+        st.session_state["staged_actions"] = list(restored_actions)
+        st.session_state["staged_draft_loaded_scope"] = draft_scope
+        if restored_actions:
+            for a in restored_actions:
+                try:
+                    _apply_optimistic_action(a)
+                except Exception:
+                    pass
     if st.session_state.get("local_synced_scope") != display_scope:
         st.session_state["local_synced_scope"] = display_scope
         st.session_state["local_synced_action_map"] = {}
@@ -1176,6 +1368,8 @@ def main():
     all_parsed_orders = result.copy()
     if "system_cutoff_date" not in st.session_state:
         st.session_state["system_cutoff_date"] = datetime.strptime(suggest_start, "%Y-%m-%d").date()
+    if "system_cutoff_dirty" not in st.session_state:
+        st.session_state["system_cutoff_dirty"] = False
     # 跨電腦同步：從雲端設定表讀取接管日（僅首次載入該 scope）
     cutoff_scope = f"{spreadsheet_id}|{worksheet_name.strip()}|{cred_path}"
     if (
@@ -1191,9 +1385,12 @@ def main():
             )
             if v:
                 st.session_state["system_cutoff_date"] = datetime.strptime(v, "%Y-%m-%d").date()
+                st.session_state["last_saved_cutoff_date"] = str(v)
         except Exception:
             pass
         st.session_state["cutoff_loaded_scope"] = cutoff_scope
+    if "last_saved_cutoff_date" not in st.session_state:
+        st.session_state["last_saved_cutoff_date"] = st.session_state["system_cutoff_date"].strftime("%Y-%m-%d")
     if "system_cutoff_date_picker" not in st.session_state:
         st.session_state["system_cutoff_date_picker"] = st.session_state["system_cutoff_date"]
     if st.session_state.get("sync_cutoff_picker_pending", False):
@@ -1204,12 +1401,13 @@ def main():
         st.date_input(
             "📅 決定系統接管日 (此日期之前的訂單將被直接封存)",
             key="system_cutoff_date_picker",
+            on_change=_mark_cutoff_dirty,
         )
         st.session_state["system_cutoff_date"] = st.session_state["system_cutoff_date_picker"]
-        # 若接管日有變動，立即寫回雲端設定，讓公司/家裡兩台一致
+        # 僅當使用者手動變更時才寫回，避免 refresh 時把預設值覆蓋雲端設定。
         if spreadsheet_id and os.path.isfile(cred_path):
             cutoff_text = st.session_state["system_cutoff_date"].strftime("%Y-%m-%d")
-            if st.session_state.get("last_saved_cutoff_date") != cutoff_text:
+            if st.session_state.get("system_cutoff_dirty", False):
                 try:
                     write_setting_value(
                         cred_path,
@@ -1218,6 +1416,7 @@ def main():
                         value=cutoff_text,
                     )
                     st.session_state["last_saved_cutoff_date"] = cutoff_text
+                    st.session_state["system_cutoff_dirty"] = False
                 except Exception:
                     pass
         st.markdown("#### 📊 接管日期分析（依本次上傳資料）")
@@ -1368,19 +1567,79 @@ def main():
         m4.metric("🚀 本次待處理新單", len(pending_orders))
         if len(duplicate_orders) > 0 or len(legacy_archive_orders) > 0:
             st.caption("歷史已處理與接管日前封存資料皆不顯示於下方卡片。")
+        if st.checkbox("顯示歷史已處理（唯讀）", key="show_filtered_history", value=False):
+            filtered_rows: list[dict[str, str]] = []
+            for _, r in duplicate_orders.iterrows():
+                uid0 = str(r.get("uid", "") or "")
+                act0 = str(effective_uid_action_map.get(uid0, "") or "").strip().lower()
+                if act0 == "write":
+                    status = "已同步寫入"
+                elif act0 == "skip":
+                    status = "已同步略過"
+                else:
+                    status = "已在歷史紀錄"
+                filtered_rows.append(
+                    {
+                        "狀態": status,
+                        "訂單成立日期": str(r.get("訂單成立日期", "") or ""),
+                        "買家": str(r.get("買家帳號", "") or ""),
+                        "商品原價": str(r.get("商品原價", "") or ""),
+                        "商品名稱": str(r.get("合併原始名稱", "") or ""),
+                    }
+                )
+            for _, r in legacy_archive_orders.iterrows():
+                filtered_rows.append(
+                    {
+                        "狀態": "接管日前封存",
+                        "訂單成立日期": str(r.get("訂單成立日期", "") or ""),
+                        "買家": str(r.get("買家帳號", "") or ""),
+                        "商品原價": str(r.get("商品原價", "") or ""),
+                        "商品名稱": str(r.get("合併原始名稱", "") or ""),
+                    }
+                )
+            if filtered_rows:
+                filtered_df = pd.DataFrame(filtered_rows)
+                status_order = ["已同步寫入", "已同步略過", "接管日前封存", "已在歷史紀錄"]
+                status_options = [s for s in status_order if s in set(filtered_df["狀態"].tolist())]
+                picked_statuses = st.multiselect(
+                    "篩選狀態",
+                    options=status_options,
+                    default=status_options,
+                    key="filtered_history_statuses",
+                )
+                if picked_statuses:
+                    filtered_df = filtered_df[filtered_df["狀態"].isin(picked_statuses)].copy()
+                else:
+                    filtered_df = filtered_df.iloc[0:0].copy()
+                st.dataframe(filtered_df, hide_index=True, width="stretch", height=280)
+            else:
+                st.caption("本次沒有被篩出的歷史資料。")
     result = pending_orders
 
     with st.sidebar:
         st.markdown("##### 🛒 同步與進度")
+        st.caption("已啟用本地草稿：刷新頁面可自動恢復未同步暫存。")
         staged_actions = _staged_actions()
         legacy_archive_actions = list(st.session_state.get("legacy_archive_actions") or [])
         total_sync_count = len(staged_actions) + len(legacy_archive_actions)
+        manual_count = len(staged_actions)
+        auto_archive_count = len(legacy_archive_actions)
         st.caption(
-            f"待同步：一般 {len(staged_actions)} 筆"
-            f"／接管日前封存 {len(legacy_archive_actions)} 筆"
+            f"待同步：手動暫存 {manual_count} 筆"
+            f"／自動封存 {auto_archive_count} 筆"
         )
+        if auto_archive_count > 0 and manual_count == 0:
+            st.info("目前待同步筆數來自「接管日前封存」自動項目，非手動暫存。")
+        if manual_count > 0 and auto_archive_count > 0:
+            sync_btn_text = f"🚀 同步手動暫存 + 自動封存（{total_sync_count} 筆）"
+        elif manual_count > 0:
+            sync_btn_text = f"🚀 同步手動暫存（{manual_count} 筆）"
+        elif auto_archive_count > 0:
+            sync_btn_text = f"🚀 同步自動封存（{auto_archive_count} 筆）"
+        else:
+            sync_btn_text = "🚀 同步本次暫存（0 筆）"
         if st.button(
-            f"🚀 同步本次暫存（{total_sync_count} 筆）",
+            sync_btn_text,
             type="primary",
             key="staged_commit_button",
         ):
@@ -1433,6 +1692,7 @@ def main():
                         )
                     gc_keep_latest_batches(cred_path, spreadsheet_id, keep=5)
                     _set_staged_actions([])
+                    _clear_local_staged_draft(str(st.session_state.get("staged_draft_scope", "") or ""))
                     st.session_state["legacy_archive_actions"] = []
                     st.session_state["history_cache_dirty"] = True
                     st.session_state["force_history_sync"] = True
@@ -1460,6 +1720,7 @@ def main():
             for a in reversed(staged_actions):
                 _revert_optimistic_action(a)
             _set_staged_actions([])
+            _clear_local_staged_draft(str(st.session_state.get("staged_draft_scope", "") or ""))
             st.session_state["legacy_archive_actions"] = []
             st.session_state["force_catalog_sync"] = True
             st.session_state["force_history_sync"] = True
@@ -1617,9 +1878,8 @@ def main():
         st.session_state.get("same_buyer_hint_max_hits", 5) or 5
     )
     enable_low_conf_hint = bool(st.session_state.get("enable_low_conf_hint", True))
-    row_upload_time_map = _latest_write_upload_time_by_row(history_actions)
-
     if cloud_df is not None and not cloud_df.empty:
+        # done 標記需每次依目前 session/staged 重新計算（不可快取）
         for pos, (idx, row) in enumerate(result.iterrows()):
             uid = f"r_{pos}_{idx}"
             row_uid = str(row.get("uid", ""))
@@ -1631,48 +1891,81 @@ def main():
             else:
                 st.session_state[f"done_{uid}"] = done_by_history
                 st.session_state[f"done_type_{uid}"] = effective_uid_action_map.get(row_uid, "")
-            tag = str(row.get("現貨預定標記", "") or "")
-            candidate_df = candidate_pool_for_stock_tag(cloud_df, tag)
-            q = str(row.get("清洗後簡體名稱", "") or "")
-            raw_nm = str(row.get("合併原始名稱", "") or "").strip()
-            top_matches = fuzzy_top3_matches(q, candidate_df)
-            top_score = int(top_matches[0][1]) if top_matches else 0
-            buyer_high_hits: list[dict[str, str]] = []
-            if enable_low_conf_hint:
-                buyer = str(row.get("買家帳號", "") or "").strip()
-                if buyer:
-                    buyer_pool = cloud_df[
-                        cloud_df["買家"].fillna("").astype(str).str.strip() == buyer
-                    ].copy()
-                    if not buyer_pool.empty:
-                        for sr, score, merged in fuzzy_top3_matches(q, buyer_pool):
-                            if int(score) < same_buyer_high_threshold:
-                                continue
-                            buyer_high_hits.append(
-                                {
-                                    "sheet_row": str(int(sr)),
-                                    "score": str(int(score)),
-                                    "name": zhconv.convert(
-                                        str(merged or "").replace("\n", " ").strip(),
-                                        "zh-tw",
-                                    ),
-                                    "upload_time": row_upload_time_map.get(int(sr), "（未知）"),
-                                }
-                            )
-            review_meta[uid] = {
-                "top_options": _build_top_pick_options(
-                    raw_nm, q, candidate_df, sku_dict_map
-                ),
-                "all_options": _build_all_pick_options(
-                    candidate_df, raw_nm, sku_dict_map, skip_first=True
-                ),
-                "top_score": top_score,
-                "buyer_high_hits": buyer_high_hits[:same_buyer_hint_max_hits],
-                "row": row,
-                "pos": pos,
-                "idx": idx,
-                "row_uid": row_uid,
-            }
+
+        result_uid_fp = hashlib.sha256(
+            "|".join(str(r.get("uid", "") or "") for _, r in result.iterrows()).encode("utf-8")
+        ).hexdigest()[:16]
+        review_scope = "|".join(
+            [
+                str(st.session_state.get("cloud_catalog_scope", "") or ""),
+                str(display_scope),
+                str(enable_low_conf_hint),
+                str(same_buyer_high_threshold),
+                str(same_buyer_hint_max_hits),
+                result_uid_fp,
+                _dict_fingerprint(sku_dict_map),
+            ]
+        )
+        cached_scope = str(st.session_state.get("review_meta_scope", "") or "")
+        cached_meta = st.session_state.get("review_meta_cache")
+        if cached_scope == review_scope and isinstance(cached_meta, dict):
+            review_meta = dict(cached_meta)
+        else:
+            buyer_hits_cache: dict[tuple[str, str], list[dict[str, str]]] = {}
+            for pos, (idx, row) in enumerate(result.iterrows()):
+                uid = f"r_{pos}_{idx}"
+                row_uid = str(row.get("uid", ""))
+                tag = str(row.get("現貨預定標記", "") or "")
+                candidate_df = candidate_pool_for_stock_tag(cloud_df, tag)
+                q = str(row.get("清洗後簡體名稱", "") or "")
+                raw_nm = str(row.get("合併原始名稱", "") or "").strip()
+                top_matches = fuzzy_top3_matches(q, candidate_df)
+                top_score = int(top_matches[0][1]) if top_matches else 0
+                buyer_high_hits: list[dict[str, str]] = []
+                if enable_low_conf_hint:
+                    buyer = str(row.get("買家帳號", "") or "").strip()
+                    if buyer:
+                        k = (buyer, q)
+                        if k in buyer_hits_cache:
+                            buyer_high_hits = list(buyer_hits_cache[k])
+                        else:
+                            buyer_pool = cloud_df[
+                                cloud_df["買家"].fillna("").astype(str).str.strip() == buyer
+                            ].copy()
+                            if not buyer_pool.empty:
+                                for sr, score, merged in fuzzy_top3_matches(q, buyer_pool):
+                                    if int(score) < same_buyer_high_threshold:
+                                        continue
+                                    buyer_high_hits.append(
+                                        {
+                                            "sheet_row": str(int(sr)),
+                                            "score": str(int(score)),
+                                            "name": zhconv.convert(
+                                                str(merged or "").replace("\n", " ").strip(),
+                                                "zh-tw",
+                                            ),
+                                            "upload_time": _sheet_open_date_text(
+                                                get_catalog_row_by_sheet_row(cloud_df, int(sr))
+                                            ),
+                                        }
+                                    )
+                            buyer_hits_cache[k] = list(buyer_high_hits)
+                review_meta[uid] = {
+                    "top_options": _build_top_pick_options(
+                        raw_nm, q, candidate_df, sku_dict_map
+                    ),
+                    "all_options": _build_all_pick_options(
+                        candidate_df, raw_nm, sku_dict_map, skip_first=True
+                    ),
+                    "top_score": top_score,
+                    "buyer_high_hits": buyer_high_hits[:same_buyer_hint_max_hits],
+                    "row": row,
+                    "pos": pos,
+                    "idx": idx,
+                    "row_uid": row_uid,
+                }
+            st.session_state["review_meta_scope"] = review_scope
+            st.session_state["review_meta_cache"] = review_meta
 
     for pos, (idx, row) in enumerate(result.iterrows()):
         uid = f"r_{pos}_{idx}"
@@ -1686,10 +1979,14 @@ def main():
         buyer = row.get("買家帳號", "")
         tag = row.get("現貨預定標記", "")
         price = row.get("商品原價", "")
-        if done_type == "skip":
+        if staged_action is not None:
+            staged_type = str(staged_action.get("action_type", "") or "").strip().lower()
+            if staged_type == "skip":
+                done_mark = " [🛒 已暫存略過｜尚未同步雲端]"
+            else:
+                done_mark = " [🛒 已暫存寫入｜尚未同步雲端]"
+        elif done_type == "skip":
             done_mark = " [⏭ 已略過｜☁️ 已同步雲端]"
-        elif staged_action is not None:
-            done_mark = " [🛒 已暫存]"
         else:
             done_mark = " [✅ 已完成｜☁️ 已同步雲端]" if done else ""
         title = f"{buyer} ｜ {tag} ｜ 商品原價：{price}{done_mark}"
@@ -1823,6 +2120,7 @@ def main():
 
             with right_c:
                 st.caption("比對與決策")
+                quick_compare_slot = st.container()
                 opt_col1, opt_col2 = st.columns(2)
                 with opt_col1:
                     show_all_available = st.toggle(
@@ -1880,6 +2178,21 @@ def main():
                     plat = str(r_preview.get("平台", "") or "").strip() or "空白"
                     buyer_now = str(r_preview.get("買家", "") or "").strip() or "空白"
                     full_name = _catalog_full_name(r_preview)
+                    with quick_compare_slot:
+                        if full_name:
+                            st.caption("完整品項（快速對照）")
+                            st.info(full_name)
+                    if enable_low_conf_hint and buyer_high_hits:
+                        with st.expander("更多參考資訊", expanded=True):
+                            st.warning(
+                                "⚠️ 偵測到同買家在整張表單有高分命中紀錄，"
+                                "請先確認是否已填過："
+                            )
+                            for h in buyer_high_hits:
+                                st.caption(
+                                    f"- 第 {h['sheet_row']} 列｜分數 {h['score']}｜"
+                                    f"{h['name']}｜開單日期 {h['upload_time']}"
+                                )
                     plat_raw = str(r_preview.get("平台", "") or "").strip()
                     buyer_raw = str(r_preview.get("買家", "") or "").strip()
                     risk_occupied = bool(buyer_raw) or (
@@ -1893,23 +2206,10 @@ def main():
                         st.success(
                             f"✅ 目標列狀態確認：平台 **{plat}** ｜ 買家 **{buyer_now}**（空位可安全寫入）"
                         )
-                    has_extra_hint = bool(enable_low_conf_hint and buyer_high_hits) or bool(full_name)
-                    if has_extra_hint:
-                        with st.expander("更多參考資訊", expanded=False):
-                            if enable_low_conf_hint and buyer_high_hits:
-                                st.warning(
-                                    "⚠️ 偵測到同買家在整張表單有高分命中紀錄，"
-                                    "請先確認是否已填過："
-                                )
-                                for h in buyer_high_hits:
-                                    st.caption(
-                                        f"- 第 {h['sheet_row']} 列｜分數 {h['score']}｜"
-                                        f"{h['name']}｜填單時間 {h['upload_time']}"
-                                    )
-                            if full_name:
-                                st.caption("目前選取完整品項：")
-                                st.info(full_name)
                 else:
+                    with quick_compare_slot:
+                        st.caption("完整品項（快速對照）")
+                        st.caption("目前尚未選取目標列。")
                     st.caption("目前此列狀態：未選取目標列")
 
             eff_now = _effective_sheet_row_from_state(
@@ -2140,6 +2440,7 @@ def main():
             )
 
         if st.button("🔄 處理下一份報表 (清除目前畫面)", type="primary"):
+            _clear_local_staged_draft(str(st.session_state.get("staged_draft_scope", "") or ""))
             # Graceful Reset：只清「本批次」相關的 UI/進度狀態，保留雲端目錄與商品字典快取
             keep_keys = {
                 "cloud_catalog_df",
@@ -2190,6 +2491,10 @@ def main():
                 "baseline_completed_uids",
                 "local_synced_scope",
                 "local_synced_action_map",
+                "staged_draft_scope",
+                "staged_draft_loaded_scope",
+                "review_meta_scope",
+                "review_meta_cache",
             }
 
             for k in list(st.session_state.keys()):

@@ -1,7 +1,20 @@
 {
+  "report": {
+    "defaultPassword": "請填你的預設解鎖密碼"
+  },
   "googleSheets": {
-    "spreadsheetUrl": "https://docs.google.com/spreadsheets/d/YOUR_SPREADSHEET_ID/edit",
-    "worksheetName": "預定(大陸現貨)",
-    "serviceAccountJsonPath": "credentials.json"
+    "activeProfile": "prod",
+    "profiles": {
+      "prod": {
+        "spreadsheetUrl": "https://docs.google.com/spreadsheets/d/1Kisr-7t_85DHpPkk-qmald_C5Qpm6oAGIFGO3cYF-uo/edit?gid=63104360#gid=63104360",
+        "worksheetName": "預定(大陸現貨)",
+        "serviceAccountJsonPath": "credentials.json"
+      },
+      "test": {
+        "spreadsheetUrl": "https://docs.google.com/spreadsheets/d/1cNKJT4Cf4ghk2yL2n1rINxdZgc9HLlR3GZhM1Kn1uJg/edit?gid=2082271300#gid=2082271300",
+        "worksheetName": "預定(大陸現貨)",
+        "serviceAccountJsonPath": "credentials.json"
+      }
+    }
   }
 }
