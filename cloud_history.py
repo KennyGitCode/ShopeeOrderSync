@@ -26,8 +26,20 @@ HISTORY_HEADERS = [
     "Last_Hint",
     "Raw_Name",
     "Order_Created_At",
+    "Stock_Tag",
+    "Expected_Platform",
 ]
 SETTINGS_HEADERS = ["Key", "Value"]
+
+
+def _col_to_letter(n: int) -> str:
+    """1-based 欄號轉 Excel 欄名。"""
+    out = ""
+    x = int(n)
+    while x > 0:
+        x, r = divmod(x - 1, 26)
+        out = chr(ord("A") + r) + out
+    return out
 
 
 def _parse_time(s: str) -> datetime:
@@ -54,7 +66,8 @@ def ensure_history_worksheet(service_account_path: str, spreadsheet_id: str):
         ws = sh.add_worksheet(title=HISTORY_SHEET_NAME, rows=2000, cols=20)
     first = ws.row_values(1)
     if [str(x).strip() for x in first[: len(HISTORY_HEADERS)]] != HISTORY_HEADERS:
-        ws.update("A1:M1", [HISTORY_HEADERS], value_input_option="USER_ENTERED")
+        end_col = _col_to_letter(len(HISTORY_HEADERS))
+        ws.update(f"A1:{end_col}1", [HISTORY_HEADERS], value_input_option="USER_ENTERED")
     return ws
 
 
@@ -128,6 +141,8 @@ def append_history_action(
     last_hint: str,
     raw_name: str = "",
     order_created_at: str = "",
+    stock_tag: str = "",
+    expected_platform: str = "",
 ) -> None:
     ws = ensure_history_worksheet(service_account_path, spreadsheet_id)
     orig = original_data or {}
@@ -146,6 +161,8 @@ def append_history_action(
             last_hint,
             str(raw_name or ""),
             str(order_created_at or ""),
+            str(stock_tag or ""),
+            str(expected_platform or ""),
         ],
         value_input_option="USER_ENTERED",
     )
@@ -179,6 +196,8 @@ def append_history_actions_batch(
                 str(a.get("last_hint", "") or ""),
                 str(a.get("raw_name", "") or ""),
                 str(a.get("order_created_at", "") or ""),
+                str(a.get("stock_tag", "") or ""),
+                str(a.get("expected_platform", "") or ""),
             ]
         )
     ws.append_rows(rows, value_input_option="USER_ENTERED")

@@ -35,6 +35,9 @@ streamlit run app.py
   "report": {
     "defaultPassword": "請填你的預設解鎖密碼"
   },
+  "history": {
+    "keepBatches": 100
+  },
   "googleSheets": {
     "activeProfile": "prod",
     "profiles": {
@@ -54,6 +57,7 @@ streamlit run app.py
 ```
 
 - **`report.defaultPassword`**：報表解鎖密碼預設值；畫面載入時會自動帶入，你仍可臨時手動修改。
+- **`history.keepBatches`**：歷史批次保留上限（最少 5，預設 100）；超過上限時自動清理更舊批次。
 - **`activeProfile`**：預設環境（例如 `prod` / `test`）。
 - 側欄可切換環境；切換時會清除本次上傳與審核狀態，避免不同表單資料混用。
 - **`serviceAccountJsonPath`**：可為相對於專案根目錄的路徑，或本機絕對路徑。

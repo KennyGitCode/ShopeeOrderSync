@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import io
 import json
 import math
@@ -22,6 +23,7 @@ import streamlit as st
 import zhconv
 
 from app_settings import (
+    load_history_keep_batches,
     load_google_sheet_config,
     load_google_sheet_profiles,
     load_report_password_default,
@@ -117,19 +119,93 @@ def generate_order_uid(order_no: str, buyer: str, normalized_name: str, part: in
 
 
 def classify_stock_type(product_name: str, option_name: str) -> str:
-    """依「原始」商品名稱／選項判定：現貨 / 預定 / 未知。"""
-    raw = ""
-    for part in (option_name, product_name):
-        if isinstance(part, str) and part.strip():
-            raw += part
-        elif part is not None and not (isinstance(part, float) and pd.isna(part)):
-            raw += str(part)
+    """優先依「商品選項名稱逗號後片段」判定；避免被固定文案誤導。"""
+    def _judge_text(text: str) -> str | None:
+        s = str(text or "").strip()
+        if not s:
+            return None
+        if ("預定" in s) or ("預購" in s):
+            return "預定"
+        if "現貨" in s:
+            return "現貨"
+        return None
 
-    if "現貨" in raw:
-        return "現貨"
-    if "預定" in raw or "預購" in raw:
-        return "預定"
+    opt = "" if option_name is None else str(option_name).strip()
+    if opt:
+        # 先看逗號（半形/全形）後的買家實際選項片段
+        opt_norm = opt.replace("，", ",")
+        tail = opt_norm.split(",")[-1].strip() if "," in opt_norm else ""
+        picked = _judge_text(tail)
+        if picked:
+            return picked
+        # 其次才看整段選項
+        picked = _judge_text(opt)
+        if picked:
+            return picked
+
+    # 若選項無法判定，才退回商品名稱；先移除常見固定文案，避免誤判。
+    name = "" if product_name is None else str(product_name).strip()
+    fixed_noise = [
+        "台灣現貨＋預定",
+        "台灣現貨+預定",
+        "現貨＋預定",
+        "現貨+預定",
+    ]
+    for t in fixed_noise:
+        name = name.replace(t, "")
+    picked = _judge_text(name)
+    if picked:
+        return picked
     return "未知"
+
+
+def expected_platform_for_stock_tag(stock_tag: str) -> str:
+    t = str(stock_tag or "").strip()
+    if t == "現貨":
+        return "預現貨"
+    if t == "預定":
+        return "空白"
+    return "不限"
+
+
+def _tag_badge_html(text: str, bg: str, fg: str = "#111827") -> str:
+    t = str(text or "").strip()
+    return (
+        f"<span style='display:inline-block;padding:2px 10px;border-radius:999px;"
+        f"background:{bg};color:{fg};font-size:12px;font-weight:700;'>{t}</span>"
+    )
+
+
+def _name_panel_html(title: str, content: str, *, min_height_px: int = 88) -> str:
+    c = html.escape(str(content or "").replace("\n", " ").strip() or "（無資料）")
+    t = html.escape(str(title or "").strip())
+    return (
+        "<div style='border:1px solid #d1d5db;border-radius:10px;padding:10px 12px;"
+        f"min-height:{int(min_height_px)}px;background:#f8fafc;'>"
+        f"<div style='font-size:12px;color:#6b7280;margin-bottom:6px;'>{t}</div>"
+        f"<div style='font-size:18px;line-height:1.45;color:#0f172a;font-weight:600;'>{c}</div>"
+        "</div>"
+    )
+
+
+def _left_tag_badge_colors(stock_tag: str) -> tuple[str, str]:
+    """左側（來源判定）固定色碼，供人工對照。"""
+    t = str(stock_tag or "").strip()
+    if t == "現貨":
+        return "#1d4ed8", "#ffffff"  # strong blue
+    if t == "預定":
+        return "#dc2626", "#ffffff"  # strong red
+    return "#e5e7eb", "#111827"  # neutral
+
+
+def _right_platform_badge_colors(expected_platform: str) -> tuple[str, str]:
+    """右側（候選平台）固定色碼，供人工對照。"""
+    p = str(expected_platform or "").strip()
+    if p == "預現貨":
+        return "#1d4ed8", "#ffffff"  # strong blue
+    if p == "空白":
+        return "#dc2626", "#ffffff"  # strong red
+    return "#e5e7eb", "#111827"  # neutral
 
 
 def row_fee_sum(row: pd.Series) -> float:
@@ -657,6 +733,30 @@ def _effective_sheet_row_from_state(
     return options[i][1]
 
 
+def _smart_default_pick_index(
+    options: list[tuple[str, int | None]],
+    blocked_rows: set[int],
+    occupied_rows: set[int],
+) -> int | None:
+    """
+    預設先選未重複列；options 既有順序已把字典命中放前面。
+    """
+    if not options:
+        return None
+    for i, (_, sr) in enumerate(options):
+        if (
+            isinstance(sr, int)
+            and sr > 0
+            and sr not in blocked_rows
+            and sr not in occupied_rows
+        ):
+            return i
+    for i, (_, sr) in enumerate(options):
+        if isinstance(sr, int) and sr > 0 and sr not in blocked_rows:
+            return i
+    return 0
+
+
 def _fingerprint_bytes(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
@@ -764,6 +864,40 @@ def _set_staged_actions(actions: list[dict]) -> None:
         _save_local_staged_draft(scope, list(actions))
 
 
+def _merge_staged_dictionary_entries(
+    base_map: dict[str, str], staged_actions: list[dict]
+) -> dict[str, str]:
+    """
+    將「未同步但已暫存」的字典學習併入當前字典映射。
+    避免重整頁面後，暫存中的字典命中提示消失。
+    """
+    out = dict(base_map or {})
+    for a in staged_actions:
+        if str(a.get("action_type", "") or "").strip().lower() != "write":
+            continue
+        raw = str(a.get("raw_name", "") or "").strip()
+        kw = str(a.get("std_keyword", "") or "").strip()
+        if raw and kw:
+            out[raw] = kw
+    return out
+
+
+def _dedupe_staged_actions_by_uid(actions: list[dict]) -> list[dict]:
+    """同一 Order_UID 只保留最後一筆動作，避免暫存計數膨脹。"""
+    out_rev: list[dict] = []
+    seen: set[str] = set()
+    for a in reversed(list(actions or [])):
+        uid = str(a.get("order_uid", "") or "").strip()
+        if not uid:
+            continue
+        if uid in seen:
+            continue
+        seen.add(uid)
+        out_rev.append(a)
+    out_rev.reverse()
+    return out_rev
+
+
 def _local_staged_draft_path() -> str:
     draft_dir = os.path.join(os.path.dirname(__file__), LOCAL_DRAFT_DIRNAME)
     os.makedirs(draft_dir, exist_ok=True)
@@ -850,10 +984,13 @@ def _apply_optimistic_action(action: dict) -> None:
     if str(action.get("action_type", "")).lower() == "write":
         tr = int(action.get("target_row", 0) or 0)
         if tr > 0:
+            before_local = dict(action.get("before_local") or {})
             _mutate_local_catalog_row(
                 tr,
                 {
-                    "平台": "蝦皮",
+                    # 未同步前保留原平台值，避免候選池被提前縮減。
+                    # 重複防呆仍由買家/價格/手續費與 blocked_rows 處理。
+                    "平台": str(before_local.get("平台", "") or ""),
                     "買家": str(action.get("buyer_account", "") or ""),
                     "賣場售價": str(action.get("sale_price", "") or ""),
                     "賣場手續費": str(action.get("fee_value", "") or ""),
@@ -1032,6 +1169,24 @@ def _sheet_open_date_text(row: pd.Series | None) -> str:
     return "（未知）"
 
 
+def _earliest_order_date_in_report(df: pd.DataFrame) -> date | None:
+    """從本次上傳報表取最早訂單成立日。"""
+    if df is None or df.empty:
+        return None
+    best: date | None = None
+    for _, row in df.iterrows():
+        dt_txt = _to_date_text(row.get("訂單成立日期"))
+        if not dt_txt:
+            continue
+        try:
+            d = datetime.strptime(dt_txt, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if best is None or d < best:
+            best = d
+    return best
+
+
 def _dict_fingerprint(m: dict[str, str]) -> str:
     if not m:
         return ""
@@ -1074,6 +1229,11 @@ def _clear_review_runtime_state() -> None:
         "staged_draft_loaded_scope",
         "review_meta_scope",
         "review_meta_cache",
+        "system_cutoff_date",
+        "system_cutoff_date_picker",
+        "cutoff_loaded_scope",
+        "last_saved_cutoff_date",
+        "system_cutoff_dirty",
     }
     for k in list(st.session_state.keys()):
         if k in clear_exact or k.startswith(clear_prefixes):
@@ -1270,6 +1430,7 @@ def main():
 
     # 雲端歷史狀態（⚙️系統歷史紀錄）
     history_actions: list[dict] = []
+    history_keep_batches = load_history_keep_batches()
     completed_uids: set[str] = set()
     processed_uids: set[str] = set()
     uid_action_map: dict[str, str] = {}
@@ -1299,8 +1460,10 @@ def main():
     st.session_state["staged_draft_scope"] = draft_scope
     if st.session_state.get("staged_draft_loaded_scope") != draft_scope:
         restored_actions = _load_local_staged_draft(draft_scope)
+        restored_actions = _dedupe_staged_actions_by_uid(restored_actions)
         st.session_state["staged_actions"] = list(restored_actions)
         st.session_state["staged_draft_loaded_scope"] = draft_scope
+        _save_local_staged_draft(draft_scope, list(restored_actions))
         if restored_actions:
             for a in restored_actions:
                 try:
@@ -1335,9 +1498,14 @@ def main():
             history_detail_map = _latest_history_detail_by_uid(history_actions)
             st.session_state["completed_uids"] = sorted(completed_uids)
             st.session_state["processed_uids"] = sorted(processed_uids)
-            gc_deleted = gc_keep_latest_batches(cred_path, spreadsheet_id, keep=5)
+            gc_deleted = gc_keep_latest_batches(
+                cred_path, spreadsheet_id, keep=history_keep_batches
+            )
             if gc_deleted > 0:
-                st.info(f"歷史表已清理舊批次紀錄列 {gc_deleted} 筆（僅保留最近 5 批）。")
+                st.info(
+                    f"歷史表已清理舊批次紀錄列 {gc_deleted} 筆"
+                    f"（僅保留最近 {history_keep_batches} 批）。"
+                )
                 st.session_state["history_cache_dirty"] = True
         except Exception as e:
             _show_user_error("⚠️ 讀取歷史紀錄失敗，先確認網路與試算表權限後再試一次。", e)
@@ -1357,6 +1525,7 @@ def main():
             str(a.get("Order_UID", "")).strip()
             for a in history_actions
             if str(a.get("Batch_ID", "")).strip() == str(active_batch_id).strip()
+            and str(a.get("Action_Type", "")).strip().lower() == "write"
             and str(a.get("Order_UID", "")).strip()
         }
         baseline_completed_uids = baseline_completed_uids - current_batch_uids
@@ -1366,8 +1535,12 @@ def main():
     effective_completed_uids = set(completed_uids) | set(local_synced_action_map.keys())
 
     all_parsed_orders = result.copy()
+    report_earliest_date = _earliest_order_date_in_report(all_parsed_orders)
+    default_cutoff_date = report_earliest_date or datetime.strptime(
+        suggest_start, "%Y-%m-%d"
+    ).date()
     if "system_cutoff_date" not in st.session_state:
-        st.session_state["system_cutoff_date"] = datetime.strptime(suggest_start, "%Y-%m-%d").date()
+        st.session_state["system_cutoff_date"] = default_cutoff_date
     if "system_cutoff_dirty" not in st.session_state:
         st.session_state["system_cutoff_dirty"] = False
     # 跨電腦同步：從雲端設定表讀取接管日（僅首次載入該 scope）
@@ -1377,6 +1550,10 @@ def main():
         and os.path.isfile(cred_path)
         and st.session_state.get("cutoff_loaded_scope") != cutoff_scope
     ):
+        # 進入新環境/新工作表時，先回到本次報表最早日期（或建議值），避免沿用舊 scope 的接管日。
+        st.session_state["system_cutoff_date"] = default_cutoff_date
+        st.session_state["system_cutoff_date_picker"] = default_cutoff_date
+        st.session_state["system_cutoff_dirty"] = False
         try:
             v = read_setting_value(
                 cred_path,
@@ -1547,6 +1724,10 @@ def main():
                     ),
                     "raw_name": normalize_item_name(str(row.get("合併原始名稱", "") or "")),
                     "order_created_at": str(row.get("訂單成立日期", "") or ""),
+                    "stock_tag": str(row.get("現貨預定標記", "") or ""),
+                    "expected_platform": expected_platform_for_stock_tag(
+                        str(row.get("現貨預定標記", "") or "")
+                    ),
                 }
             )
             continue
@@ -1619,7 +1800,9 @@ def main():
     with st.sidebar:
         st.markdown("##### 🛒 同步與進度")
         st.caption("已啟用本地草稿：刷新頁面可自動恢復未同步暫存。")
-        staged_actions = _staged_actions()
+        staged_actions = _dedupe_staged_actions_by_uid(_staged_actions())
+        if len(staged_actions) != len(_staged_actions()):
+            _set_staged_actions(staged_actions)
         legacy_archive_actions = list(st.session_state.get("legacy_archive_actions") or [])
         total_sync_count = len(staged_actions) + len(legacy_archive_actions)
         manual_count = len(staged_actions)
@@ -1690,7 +1873,9 @@ def main():
                             spreadsheet_id,
                             dict_entries,
                         )
-                    gc_keep_latest_batches(cred_path, spreadsheet_id, keep=5)
+                    gc_keep_latest_batches(
+                        cred_path, spreadsheet_id, keep=history_keep_batches
+                    )
                     _set_staged_actions([])
                     _clear_local_staged_draft(str(st.session_state.get("staged_draft_scope", "") or ""))
                     st.session_state["legacy_archive_actions"] = []
@@ -1730,6 +1915,7 @@ def main():
 
         st.divider()
         with st.expander("🕒 系統歷史與批次回溯", expanded=False):
+            st.caption(f"歷史批次保留上限：最近 {history_keep_batches} 批")
             latest_hint = _latest_last_hint(history_actions)
             if latest_hint:
                 st.caption(f"上次進度：{latest_hint}")
@@ -1869,7 +2055,10 @@ def main():
         except Exception:
             sku_dict_map = {}
 
-    staged_actions = _staged_actions()
+    staged_actions = _dedupe_staged_actions_by_uid(_staged_actions())
+    if len(staged_actions) != len(_staged_actions()):
+        _set_staged_actions(staged_actions)
+    sku_dict_map = _merge_staged_dictionary_entries(sku_dict_map, staged_actions)
     staged_by_uid = _staged_map_by_uid(staged_actions)
     same_buyer_high_threshold = int(
         st.session_state.get("same_buyer_high_threshold", 70) or 70
@@ -1998,10 +2187,51 @@ def main():
 
             if staged_action is not None:
                 st.info("🛒 這筆已加入待提交佇列，尚未寫入雲端。")
+                expected_platform = expected_platform_for_stock_tag(str(tag or ""))
+                left_bg, left_fg = _left_tag_badge_colors(str(tag or ""))
+                right_bg, right_fg = _right_platform_badge_colors(expected_platform)
+                badge_l, badge_r = st.columns(2)
+                with badge_l:
+                    st.markdown(
+                        _tag_badge_html(f"來源判定：{tag or '未知'}", left_bg, left_fg),
+                        unsafe_allow_html=True,
+                    )
+                with badge_r:
+                    st.markdown(
+                        _tag_badge_html(f"候選平台：{expected_platform}", right_bg, right_fg),
+                        unsafe_allow_html=True,
+                    )
+                left_p, right_p = st.columns([1, 1])
+                with left_p:
+                    st.markdown(
+                        _name_panel_html("蝦皮商品名稱", merged_disp, min_height_px=92),
+                        unsafe_allow_html=True,
+                    )
                 if str(staged_action.get("action_type", "")).lower() == "skip":
                     st.success("⏭️ 已暫存為略過。")
+                    with right_p:
+                        st.markdown(
+                            _name_panel_html("雲端完整品項（快速對照）", "此筆為略過，未指定目標列。", min_height_px=92),
+                            unsafe_allow_html=True,
+                        )
                 else:
-                    st.success(f"💾 已暫存寫入：第 {int(staged_action.get('target_row', 0) or 0)} 列。")
+                    target_row_now = int(staged_action.get("target_row", 0) or 0)
+                    st.success(f"💾 已暫存寫入：第 {target_row_now} 列。")
+                    row_now = (
+                        get_catalog_row_by_sheet_row(cloud_df, target_row_now)
+                        if (cloud_df is not None and not cloud_df.empty and target_row_now > 0)
+                        else None
+                    )
+                    row_name = _catalog_full_name(row_now) if row_now is not None else ""
+                    with right_p:
+                        st.markdown(
+                            _name_panel_html(
+                                "雲端完整品項（快速對照）",
+                                row_name or f"第 {target_row_now} 列（目前無法讀取名稱）",
+                                min_height_px=92,
+                            ),
+                            unsafe_allow_html=True,
+                        )
                 if st.button("↩️ 撤銷暫存", key=f"unstage_{uid}"):
                     acts = _staged_actions()
                     keep: list[dict] = []
@@ -2115,11 +2345,34 @@ def main():
             left_c, right_c = st.columns([1, 1])
             with left_c:
                 st.caption("商品與訂單")
-                st.info(merged_disp)
+                expected_platform = expected_platform_for_stock_tag(str(tag or ""))
+                left_bg, left_fg = _left_tag_badge_colors(str(tag or ""))
+                st.markdown(
+                    _tag_badge_html(
+                        f"來源判定：{tag or '未知'}",
+                        left_bg,
+                        left_fg,
+                    ),
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    _name_panel_html("蝦皮商品名稱", merged_disp, min_height_px=92),
+                    unsafe_allow_html=True,
+                )
                 st.metric("單件實扣手續費", f"{fee_int}")
 
             with right_c:
                 st.caption("比對與決策")
+                expected_platform = expected_platform_for_stock_tag(str(tag or ""))
+                right_bg, right_fg = _right_platform_badge_colors(expected_platform)
+                st.markdown(
+                    _tag_badge_html(
+                        f"候選平台：{expected_platform}",
+                        right_bg,
+                        right_fg,
+                    ),
+                    unsafe_allow_html=True,
+                )
                 quick_compare_slot = st.container()
                 opt_col1, opt_col2 = st.columns(2)
                 with opt_col1:
@@ -2140,20 +2393,69 @@ def main():
                     st.session_state[mode_key] = bool(show_all_available)
 
                 options = all_options if show_all_available else top_options
+                blocked_rows: set[int] = set()
+                for a in staged_actions:
+                    if str(a.get("action_type", "") or "").strip().lower() != "write":
+                        continue
+                    if str(a.get("order_uid", "") or "").strip() == row_uid:
+                        continue
+                    tr0 = a.get("target_row")
+                    try:
+                        tr_int = int(tr0 or 0)
+                    except Exception:
+                        tr_int = 0
+                    if tr_int > 0:
+                        blocked_rows.add(tr_int)
+                occupied_rows: set[int] = set()
+                for _, sr0 in options:
+                    if not isinstance(sr0, int) or sr0 <= 0:
+                        continue
+                    r_cand = get_catalog_row_by_sheet_row(cloud_df, sr0)
+                    if row_has_order_like_data(r_cand):
+                        occupied_rows.add(sr0)
+                default_pick_index = (
+                    None
+                    if show_all_available
+                    else _smart_default_pick_index(
+                        options, blocked_rows, occupied_rows
+                    )
+                )
+                sel_key = f"cloud_sel_{uid}"
+                if not manual:
+                    cur_sel = st.session_state.get(sel_key)
+                    cur_idx: int | None
+                    try:
+                        cur_idx = int(cur_sel) if cur_sel is not None else None
+                    except Exception:
+                        cur_idx = None
+                    needs_reset = False
+                    if cur_idx is None:
+                        needs_reset = True
+                    elif cur_idx < 0 or cur_idx >= len(options):
+                        needs_reset = True
+                    else:
+                        cur_sr = options[cur_idx][1]
+                        if isinstance(cur_sr, int) and (
+                            cur_sr in blocked_rows or cur_sr in occupied_rows
+                        ):
+                            needs_reset = True
+                    if needs_reset and default_pick_index is not None:
+                        st.session_state[sel_key] = int(default_pick_index)
                 labels = [o[0] for o in options]
-                st.selectbox(
+                select_kwargs: dict[str, object] = {
+                    "format_func": (lambda i: labels[i]),
+                    "key": sel_key,
+                }
+                if show_all_available:
+                    select_kwargs["placeholder"] = "請點擊此處並直接輸入鍵盤關鍵字搜尋 (例如: cd080)..."
+                if sel_key not in st.session_state:
+                    select_kwargs["index"] = default_pick_index
+                selected_option_index = st.selectbox(
                     "可用空位清單（可鍵盤搜尋）"
                     if show_all_available
                     else "推薦雲端列（可選略過不寫入）",
                     range(len(labels)),
-                    format_func=lambda i: labels[i],
-                    index=None if show_all_available else 0,
-                    placeholder=(
-                        "請點擊此處並直接輸入鍵盤關鍵字搜尋 (例如: cd080)..."
-                        if show_all_available
-                        else None
-                    ),
-                    key=f"cloud_sel_{uid}",
+                    **select_kwargs,
                 )
                 if manual:
                     st.number_input(
@@ -2164,11 +2466,19 @@ def main():
                         key=f"manual_row_{uid}",
                     )
 
-                eff_preview = _effective_sheet_row_from_state(
-                    uid,
-                    options,
-                    default_index=None if show_all_available else 0,
-                )
+                if manual:
+                    eff_preview = _effective_sheet_row_from_state(
+                        uid,
+                        options,
+                        default_index=default_pick_index,
+                    )
+                else:
+                    if selected_option_index is None:
+                        eff_preview = None
+                    elif 0 <= int(selected_option_index) < len(options):
+                        eff_preview = options[int(selected_option_index)][1]
+                    else:
+                        eff_preview = None
                 r_preview = (
                     get_catalog_row_by_sheet_row(cloud_df, eff_preview)
                     if eff_preview is not None
@@ -2180,8 +2490,10 @@ def main():
                     full_name = _catalog_full_name(r_preview)
                     with quick_compare_slot:
                         if full_name:
-                            st.caption("完整品項（快速對照）")
-                            st.info(full_name)
+                            st.markdown(
+                                _name_panel_html("雲端完整品項（快速對照）", full_name, min_height_px=92),
+                                unsafe_allow_html=True,
+                            )
                     if enable_low_conf_hint and buyer_high_hits:
                         with st.expander("更多參考資訊", expanded=True):
                             st.warning(
@@ -2208,15 +2520,25 @@ def main():
                         )
                 else:
                     with quick_compare_slot:
-                        st.caption("完整品項（快速對照）")
-                        st.caption("目前尚未選取目標列。")
+                        st.markdown(
+                            _name_panel_html("雲端完整品項（快速對照）", "目前尚未選取目標列。", min_height_px=92),
+                            unsafe_allow_html=True,
+                        )
                     st.caption("目前此列狀態：未選取目標列")
 
-            eff_now = _effective_sheet_row_from_state(
-                uid,
-                options,
-                default_index=None if show_all_available else 0,
-            )
+            if manual:
+                eff_now = _effective_sheet_row_from_state(
+                    uid,
+                    options,
+                    default_index=default_pick_index,
+                )
+            else:
+                if selected_option_index is None:
+                    eff_now = None
+                elif 0 <= int(selected_option_index) < len(options):
+                    eff_now = options[int(selected_option_index)][1]
+                else:
+                    eff_now = None
 
             r_target = (
                 get_catalog_row_by_sheet_row(cloud_df, eff_now)
@@ -2301,6 +2623,8 @@ def main():
                             "last_hint": hint,
                             "raw_name": str(row.get("合併原始名稱", "") or ""),
                             "order_created_at": str(row.get("訂單成立日期", "") or ""),
+                            "stock_tag": str(tag or ""),
+                            "expected_platform": expected_platform_for_stock_tag(str(tag or "")),
                         }
                     )
                     _set_staged_actions(keep)
@@ -2352,6 +2676,8 @@ def main():
                         "prev_dict_keyword": prev_dict_kw,
                         "before_local": before_vals,
                         "order_created_at": str(row.get("訂單成立日期", "") or ""),
+                        "stock_tag": str(tag or ""),
+                        "expected_platform": expected_platform_for_stock_tag(str(tag or "")),
                     }
                     acts = _staged_actions()
                     keep: list[dict] = []
@@ -2380,7 +2706,11 @@ def main():
         for _, row in result.iterrows()
         if str(row.get("uid", "") or "") in completed_uids
     )
-    staged_count = len(_staged_actions())
+    row_uid_set = {str(r.get("uid", "") or "") for _, r in result.iterrows()}
+    staged_count = sum(
+        1 for a in _dedupe_staged_actions_by_uid(_staged_actions())
+        if str(a.get("order_uid", "") or "") in row_uid_set
+    )
     st.progress(0 if total_cards == 0 else committed_count / total_cards)
     st.caption(
         f"本次處理進度：已提交 {committed_count}/{total_cards} 筆"

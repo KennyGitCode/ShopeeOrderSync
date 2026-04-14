@@ -2,6 +2,9 @@
   "report": {
     "defaultPassword": "請填你的預設解鎖密碼"
   },
+  "history": {
+    "keepBatches": 100
+  },
   "googleSheets": {
     "activeProfile": "prod",
     "profiles": {

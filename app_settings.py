@@ -115,6 +115,22 @@ def load_report_password_default() -> str:
     return pwd.strip()
 
 
+def load_history_keep_batches() -> int:
+    """讀取歷史保留批次數（最少 5，預設 100）。"""
+    data, _ = _read_appsetting_json()
+    sec = data.get("history")
+    if not isinstance(sec, dict):
+        sec = data.get("historySettings")
+    if not isinstance(sec, dict):
+        return 100
+    raw = sec.get("keepBatches")
+    try:
+        keep = int(raw)
+    except Exception:
+        return 100
+    return max(5, keep)
+
+
 def load_google_sheet_config(profile_name: str | None = None) -> tuple[str, str, str, str | None]:
     """
     回傳：(spreadsheet_url, worksheet_name, service_account_json_abs_path, error_message)
