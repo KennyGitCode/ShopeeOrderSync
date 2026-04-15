@@ -206,7 +206,14 @@ def fetch_worksheet_catalog(
     gc = open_gspread_client(service_account_path)
     sh = gc.open_by_key(spreadsheet_id)
     ws = sh.worksheet(worksheet_name)
-    all_values = ws.get_all_values()
+    # 優先讀「未格式化值」：日期欄可拿到原始序號/完整值，避免僅顯示 8/3 失去年份。
+    try:
+        all_values = ws.get(
+            "A:ZZ",
+            value_render_option="UNFORMATTED_VALUE",
+        )
+    except Exception:
+        all_values = ws.get_all_values()
     if not all_values:
         return pd.DataFrame()
 
