@@ -21,6 +21,10 @@ import msoffcrypto
 import pandas as pd
 import streamlit as st
 import zhconv
+try:
+    import plotly.graph_objects as go
+except Exception:
+    go = None
 
 from app_settings import (
     load_history_keep_batches,
@@ -81,6 +85,19 @@ REQUIRED_COLUMNS = [
 
 LOCAL_DRAFT_DIRNAME = ".cache"
 LOCAL_STAGED_DRAFT_FILENAME = "staged_actions_draft.json"
+DEFAULT_REPORT_SNAPSHOT_WORKSHEET = "Batch_Sync_Logs"
+
+REPORT_SNAPSHOT_HEADERS = [
+    "同步時間",
+    "同步年月",
+    "本次寫入筆數",
+    "總實收",
+    "總平台手續費",
+    "總成本",
+    "總利潤",
+    "平均手續費率",
+]
+COST_COLUMN_WHITELIST = ["成本", "單價成本", "unit_cost", "cost", "original_cost"]
 
 def clean_name_for_simplified(text: str) -> str:
     """與 `text_normalize.normalize_for_match` 相同，供階段一產出 `清洗後簡體名稱`。"""
@@ -160,12 +177,25 @@ def classify_stock_type(product_name: str, option_name: str) -> str:
 
 
 def expected_platform_for_stock_tag(stock_tag: str) -> str:
+    """
+    由左欄「來源／庫存標籤」推導右欄「候選平台」顯示字串。
+    徽章配色嚴格使用固定映射（來源：預定/現貨；候選：空白/預現貨）。
+    """
     t = str(stock_tag or "").strip()
     if t == "現貨":
         return "預現貨"
     if t == "預定":
         return "空白"
     return "不限"
+
+
+def _paired_source_platform_badge_colors(
+    stock_tag: str,
+) -> tuple[tuple[str, str], tuple[str, str]]:
+    """左右列徽章固定成對配色 (bg, fg)。"""
+    return _left_tag_badge_colors(stock_tag), _right_platform_badge_colors(
+        expected_platform_for_stock_tag(stock_tag)
+    )
 
 
 def _tag_badge_html(text: str, bg: str, fg: str = "#111827") -> str:
@@ -180,32 +210,273 @@ def _name_panel_html(title: str, content: str, *, min_height_px: int = 88) -> st
     c = html.escape(str(content or "").replace("\n", " ").strip() or "（無資料）")
     t = html.escape(str(title or "").strip())
     return (
-        "<div style='border:1px solid #d1d5db;border-radius:10px;padding:10px 12px;"
-        f"min-height:{int(min_height_px)}px;background:#f8fafc;'>"
+        "<div style='border:none;border-radius:12px;padding:11px 13px;"
+        f"min-height:{int(min_height_px)}px;background:#f8fafc;"
+        "box-shadow:0 1px 2px rgba(15,23,42,0.06);'>"
         f"<div style='font-size:12px;color:#6b7280;margin-bottom:6px;'>{t}</div>"
-        f"<div style='font-size:18px;line-height:1.45;color:#0f172a;font-weight:600;'>{c}</div>"
+        f"<div style='font-size:17px;line-height:1.45;color:#0f172a;font-weight:600;'>{c}</div>"
         "</div>"
     )
 
 
+def _label_with_hint_html(text: str) -> str:
+    s = str(text or "").strip()
+    if "（" in s and s.endswith("）"):
+        main, rest = s.split("（", 1)
+        hint = rest[:-1]
+        return (
+            f"<span style='font-weight:700;color:#344054;'>{html.escape(main.strip())}</span>"
+            f"<span style='color:#98A2B3;'>（{html.escape(hint.strip())}）</span>"
+        )
+    return f"<span style='font-weight:700;color:#344054;'>{html.escape(s)}</span>"
+
+
+# 財務欄位統一底：減少大面積色塊，正負面改以字色與字重表現
+_METRIC_SURFACE = "#ffffff"
+_METRIC_BORDER = "rgba(15, 23, 42, 0.07)"
+
+
+def _metric_block_html(
+    title: str,
+    value: str,
+    *,
+    tone: str = "#101828",
+    bg: str | None = None,
+    border: str | None = None,
+    value_size: str = "md",
+    soft: bool = True,
+    html_class: str | None = None,
+) -> str:
+    """
+    財務數字區塊：預設白底 + 淡邊線；強調依賴字色（tone），避免整塊填色。
+    value_size: md / lg / hero（利潤用 hero 強調）
+    """
+    sizes = {"md": "2.15rem", "lg": "2.38rem", "hero": "2.72rem"}
+    fs = sizes.get(value_size, sizes["md"])
+    surf = _METRIC_SURFACE if bg is None else bg
+    border_style = (
+        f"border:1px solid {_METRIC_BORDER};"
+        if border is None
+        else f"border:1px solid {border};"
+    )
+    shadow = (
+        "box-shadow:0 1px 2px rgba(15, 23, 42, 0.04);"
+        if soft
+        else ""
+    )
+    cls = f' class="{html.escape(html_class)}"' if html_class else ""
+    return (
+        f"<div{cls} style='{border_style}border-radius:12px;padding:10px 12px;background:{surf};{shadow}'>"
+        f"<div style='font-size:0.86rem;line-height:1.3;'>{_label_with_hint_html(title)}</div>"
+        f"<div style='font-size:{fs};font-weight:800;line-height:1.08;color:{tone};margin-top:6px;letter-spacing:-0.02em;'>"
+        f"{html.escape(str(value or '—'))}</div>"
+        "</div>"
+    )
+
+
+def _min_selling_price_for_target_profit_pct(
+    cost: float,
+    fee_rate: float,
+    target_profit_pct: float,
+) -> float | None:
+    """
+    假設手續費與售價成固定比例 fee_rate（本筆實扣/實收），
+    目標利潤率 target_profit_pct 定義為「利潤 / 實售收入（實收-手續費）」。
+    設 P=實收、k=fee_rate、t=target，
+    利潤率 = (P-P*k-cost)/(P-P*k) = 1 - cost/(P*(1-k)) >= t
+    得 P >= cost / ((1-k)*(1-t))。
+    若分母 <= 0 則無解。
+    """
+    t = float(target_profit_pct) / 100.0
+    k = float(fee_rate)
+    den = (1.0 - k) * (1.0 - t)
+    if den <= 1e-9 or cost <= 0:
+        return None
+    return float(cost) / den
+
+
+def _profit_alert_card(
+    kind: str,
+    title_line: str,
+    subtitle: str,
+) -> str:
+    """精簡 Alert：左側色條 + 白底（紅色僅作警示條與標題字色，不大面積鋪色）。"""
+    styles = {
+        "danger": ("#fecaca", "#b91c1c", "#ffffff", "#991b1b"),
+        "warning": ("#fcd34d", "#d97706", "#ffffff", "#92400e"),
+        "success": ("#6ee7b7", "#047857", "#ffffff", "#065f46"),
+        "neutral": ("#e5e7eb", "#64748b", "#ffffff", "#475569"),
+    }
+    _, bar, bg, title_c = styles.get(kind, styles["neutral"])
+    sub_esc = html.escape(subtitle)
+    title_esc = html.escape(title_line)
+    return (
+        "<div class=\"shopee-fin-compare-panel\" style='margin-top:0;padding:0;border-radius:12px;overflow:hidden;"
+        f"background:{bg};border:1px solid #e5e7eb;box-shadow:0 1px 2px rgba(15,23,42,0.04);'>"
+        "<div style='display:flex;min-height:100%;'>"
+        f"<div style='width:4px;flex-shrink:0;background:{bar};'></div>"
+        "<div style='padding:10px 12px 10px 12px;flex:1;'>"
+        f"<div style='font-size:1.02rem;font-weight:900;color:{title_c};line-height:1.35;'>{title_esc}</div>"
+        f"<div style='font-size:0.76rem;color:#98A2B3;margin-top:6px;line-height:1.45;'>{sub_esc}</div>"
+        "</div></div></div>"
+    )
+
+
+def _profit_analysis_panel(
+    kind: str,
+    title_line: str,
+    subtitle: str,
+    footer_html: str = "",
+) -> str:
+    """
+    負利潤時：警示 + 建議售價整合為單一面板，較連貫且易與左欄實售收入對齊。
+    """
+    styles = {
+        "danger": ("#b91c1c", "#991b1b"),
+        "warning": ("#d97706", "#92400e"),
+        "success": ("#047857", "#065f46"),
+        "neutral": ("#64748b", "#475569"),
+    }
+    bar, title_c = styles.get(kind, styles["neutral"])
+    sub_esc = html.escape(subtitle)
+    title_esc = html.escape(title_line)
+    top = (
+        "<div style='display:flex;min-height:100%;'>"
+        f"<div style='width:4px;flex-shrink:0;background:{bar};'></div>"
+        "<div style='padding:12px 14px 12px 12px;flex:1;'>"
+        f"<div style='font-size:0.88rem;font-weight:800;color:{title_c};line-height:1.4;'>{title_esc}</div>"
+        f"<div style='font-size:0.76rem;color:#98A2B3;margin-top:6px;line-height:1.45;'>{sub_esc}</div>"
+        "</div></div>"
+    )
+    foot = (
+        f"<div style='border-top:1px solid #f1f5f9;padding:11px 14px 12px 16px;background:#fafafa;'>{footer_html}</div>"
+        if footer_html
+        else ""
+    )
+    return (
+        "<div class=\"shopee-fin-compare-panel\" style='margin-top:0;border-radius:12px;border:1px solid #e5e7eb;background:#ffffff;"
+        "box-shadow:0 1px 3px rgba(15,23,42,0.06);overflow:hidden;'>"
+        f"{top}{foot}</div>"
+    )
+
+
+def _suggested_price_footer_html(p_sug: int, hint_title: str) -> str:
+    """負利潤時建議售價：標題與金額分行，金額加大且支援長數字換行。"""
+    amt = f"{int(p_sug):,}"
+    label = "💡 " + "建議實收售價（台幣）"
+    line2 = f"至少 {amt} 元"
+    return (
+        "<div style='display:flex;flex-direction:column;gap:10px;align-items:stretch;"
+        "width:100%;max-width:100%;box-sizing:border-box;'>"
+        "<div style='display:flex;align-items:center;justify-content:flex-start;"
+        "gap:6px;flex-wrap:nowrap;'>"
+        "<span style='font-size:0.82rem;font-weight:800;color:#0f766e;line-height:1.35;'>"
+        f"{html.escape(label)}</span>"
+        "<span style='display:inline-flex;align-items:center;justify-content:center;"
+        "flex-shrink:0;min-width:1.2rem;height:1.2rem;border-radius:999px;"
+        "border:1px solid #d1d5db;background:#ffffff;color:#64748b;"
+        "font-size:0.72rem;font-weight:900;cursor:help;line-height:1;' "
+        f'title="{hint_title}">?</span>'
+        "</div>"
+        "<div style='font-size:clamp(1.35rem, 4vw, 1.85rem);font-weight:900;"
+        "line-height:1.25;color:#047857;letter-spacing:-0.03em;"
+        "font-variant-numeric: tabular-nums;"
+        "word-break:break-word;overflow-wrap:anywhere;padding:6px 8px 6px 0;"
+        "border-top:1px dashed #d1fae5;margin-top:2px;'>"
+        f"{html.escape(line2)}"
+        "</div>"
+        "</div>"
+    )
+
+
+def _amount_gap_hint_html(shopee_twd: int, est_twd: int, amount_gap_pct: float) -> str:
+    """金額差距提示：沿用系統卡片語彙（白底+左色條），減少突兀感。"""
+    gap_abs = abs(int(shopee_twd) - int(est_twd))
+    title = "⚠️ 金額差距偏大"
+    detail = (
+        f"實收 {int(shopee_twd):,} / 成本 {int(est_twd):,} / "
+        f"差距 {int(gap_abs):,}（{float(amount_gap_pct):.1f}%）"
+    )
+    return (
+        "<div style='margin-top:2px;border:1px solid #e5e7eb;border-radius:10px;"
+        "background:#ffffff;box-shadow:0 1px 2px rgba(15,23,42,0.04);overflow:hidden;'>"
+        "<div style='display:flex;'>"
+        "<div style='width:4px;flex-shrink:0;background:#f59e0b;'></div>"
+        "<div style='padding:8px 10px;flex:1;'>"
+        f"<div style='font-size:0.80rem;font-weight:800;color:#92400e;line-height:1.3;'>{html.escape(title)}</div>"
+        f"<div style='font-size:0.75rem;color:#6b7280;line-height:1.4;margin-top:4px;'>{html.escape(detail)}</div>"
+        "</div></div></div>"
+    )
+
+
+def _battle_metric_card_html(
+    title: str,
+    value_text: str,
+    unit_text: str = "",
+    *,
+    accent: str = "#0f172a",
+    badge_text: str = "",
+    badge_bg: str = "#dcfce7",
+    badge_fg: str = "#166534",
+) -> str:
+    """戰報頂部指標卡：取代 st.metric 避免標題截斷與留白失衡。"""
+    unit_html = (
+        f"<span style='font-size:0.78rem;color:#64748b;font-weight:700;margin-left:4px;'>{html.escape(unit_text)}</span>"
+        if unit_text
+        else ""
+    )
+    badge_html = (
+        "<div style='margin-top:10px;'>"
+        f"<span style='display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;"
+        f"background:{badge_bg};color:{badge_fg};font-size:0.74rem;font-weight:800;'>"
+        f"{html.escape(badge_text)}</span></div>"
+        if badge_text
+        else ""
+    )
+    return (
+        "<div style='height:100%;min-height:104px;border:1px solid #eceff3;border-radius:8px;"
+        "background:#fafafa;box-shadow:0 1px 3px rgba(15,23,42,0.06);padding:15px;"
+        "display:flex;flex-direction:column;justify-content:flex-start;box-sizing:border-box;'>"
+        f"<div style='font-size:14px;color:#666;font-weight:700;line-height:1.25;white-space:normal;'>{html.escape(title)}</div>"
+        f"<div style='margin-top:8px;display:flex;align-items:baseline;gap:2px;flex-wrap:wrap;'>"
+        f"<span style='font-size:2rem;line-height:1.1;font-weight:900;color:{accent};font-variant-numeric:tabular-nums;'>{html.escape(value_text)}</span>"
+        f"{unit_html}</div>"
+        f"{badge_html}</div>"
+    )
+
+
+def _extract_cost_from_cloud_row(row: pd.Series | None) -> float | None:
+    """從雲端列以白名單+模糊匹配抓取成本值。"""
+    if row is None:
+        return None
+    keys = [str(k or "") for k in row.index.tolist()]
+    key_norm = {k: k.lower().replace(" ", "").replace("_", "") for k in keys}
+    wl_norm = [w.lower().replace(" ", "").replace("_", "") for w in COST_COLUMN_WHITELIST]
+    for k in keys:
+        kn = key_norm.get(k, "")
+        if any((w in kn) or (kn in w) for w in wl_norm):
+            v = _money_to_float(row.get(k, ""))
+            if v is not None and v > 0:
+                return float(v)
+    return None
+
+
 def _left_tag_badge_colors(stock_tag: str) -> tuple[str, str]:
-    """左側（來源判定）固定色碼，供人工對照。"""
-    t = str(stock_tag or "").strip()
-    if t == "現貨":
-        return "#1d4ed8", "#ffffff"  # strong blue
-    if t == "預定":
-        return "#dc2626", "#ffffff"  # strong red
-    return "#e5e7eb", "#111827"  # neutral
+    """來源判定固定映射：預定→Color A，現貨→Color B，其餘→Error/Default。"""
+    color_map = {
+        "預定": ("#1e3a8a", "#ffffff"),  # Color A
+        "現貨": ("#047857", "#ffffff"),  # Color B
+    }
+    return color_map.get(str(stock_tag or "").strip(), ("#ef4444", "#ffffff"))
 
 
 def _right_platform_badge_colors(expected_platform: str) -> tuple[str, str]:
-    """右側（候選平台）固定色碼，供人工對照。"""
-    p = str(expected_platform or "").strip()
-    if p == "預現貨":
-        return "#1d4ed8", "#ffffff"  # strong blue
-    if p == "空白":
-        return "#dc2626", "#ffffff"  # strong red
-    return "#e5e7eb", "#111827"  # neutral
+    """候選平台固定映射：空白→Color A，預現貨→Color B，其餘→Error/Default。"""
+    color_map = {
+        "空白": ("#1e3a8a", "#ffffff"),   # Color A
+        "預現貨": ("#047857", "#ffffff"),  # Color B
+    }
+    return color_map.get(str(expected_platform or "").strip(), ("#ef4444", "#ffffff"))
 
 
 def row_fee_sum(row: pd.Series) -> float:
@@ -611,6 +882,27 @@ def _format_row_label_dict_hit(row: pd.Series) -> str:
     return f"[✨ 字典命中] 第 {sr} 列 - {pn} {xi}".strip()
 
 
+def _with_occupied_prefix(label: str, row: pd.Series) -> str:
+    """若該列已有資料，於標籤前加上佔用提示。"""
+    if _row_is_occupied_for_ui(row):
+        return f"[⚠️ 已佔用] {label}"
+    return label
+
+
+def _row_is_occupied_for_ui(row: pd.Series | None) -> bool:
+    """
+    UI 端「已佔用」判斷：與覆蓋警告一致。
+    - 買家非空 -> 佔用
+    - 平台非空且不是「預現貨」-> 佔用
+    - 或既有的訂單欄位（買家/售價/手續費）有值 -> 佔用
+    """
+    if row is None:
+        return False
+    buyer_raw = str(row.get("買家", "") or "").strip()
+    plat_raw = str(row.get("平台", "") or "").strip()
+    return bool(buyer_raw) or (bool(plat_raw) and plat_raw != "預現貨") or row_has_order_like_data(row)
+
+
 def _catalog_full_name(row: pd.Series | None) -> str:
     if row is None:
         return ""
@@ -623,6 +915,27 @@ def _catalog_full_name(row: pd.Series | None) -> str:
         "zh-tw",
     )
     return f"{pn} {xi}".strip()
+
+
+def _has_useful_candidate_data(row: pd.Series | None) -> bool:
+    """
+    展開所有候選列時的最小資料門檻：
+    - 具備可辨識名稱（檔名/品名/款式/商品名稱）之一，或
+    - 具備有效售價（> 0）
+    以避免顯示「第 N 列 -」這類幾乎全空白列。
+    """
+    if row is None:
+        return False
+    name_cols = ("檔名", "品名", "款式細項", "商品名稱")
+    for c in name_cols:
+        if str(row.get(c, "") or "").strip():
+            return True
+    price_cols = ("賣場售價", "售價", "價格")
+    for c in price_cols:
+        v = _money_to_int(row.get(c, ""))
+        if isinstance(v, int) and v > 0:
+            return True
+    return False
 
 
 def _build_top_pick_options(
@@ -660,22 +973,30 @@ def _build_all_pick_options(
     *,
     skip_first: bool,
 ) -> list[tuple[str, int | None]]:
-    """展開模式：略過後接字典命中，其餘候選池列依序。"""
+    """展開模式：略過後先顯示已佔用列，再顯示其餘列（字典命中仍保留）。"""
     opts: list[tuple[str, int | None]] = []
     raw_key = (raw_name or "").strip()
     hit_rows: set[int] = set()
-    dict_labels: list[tuple[str, int]] = []
+    occupied_labels: list[tuple[str, int]] = []
+    normal_labels: list[tuple[str, int]] = []
     if raw_key in dict_map:
         kw = dict_map[raw_key]
         for sr, row in _dict_hits_in_candidate_pool(candidate_df, kw):
+            if not _has_useful_candidate_data(row):
+                continue
             hit_rows.add(sr)
-            dict_labels.append((_format_row_label_dict_hit(row), sr))
+            lb = _with_occupied_prefix(_format_row_label_dict_hit(row), row)
+            if _row_is_occupied_for_ui(row):
+                occupied_labels.append((lb, sr))
+            else:
+                normal_labels.append((lb, sr))
+    other_occupied: list[tuple[str, int]] = []
+    other_normal: list[tuple[str, int]] = []
     if skip_first:
         opts.append(("略過不寫入", None))
-        opts.extend(dict_labels)
-    else:
-        opts.extend(dict_labels)
     for _, row in candidate_df.iterrows():
+        if not _has_useful_candidate_data(row):
+            continue
         sheet_row = int(row.get("_sheet_row", 0) or 0)
         if sheet_row <= 0 or sheet_row in hit_rows:
             continue
@@ -687,7 +1008,17 @@ def _build_all_pick_options(
             str(row.get("款式細項", "") or "").replace("\n", " ").strip(),
             "zh-tw",
         )
-        opts.append((f"第 {sheet_row} 列 - {pn} {xi}".strip(), sheet_row))
+        base_label = f"第 {sheet_row} 列 - {pn} {xi}".strip()
+        label = _with_occupied_prefix(base_label, row)
+        if _row_is_occupied_for_ui(row):
+            other_occupied.append((label, sheet_row))
+        else:
+            other_normal.append((label, sheet_row))
+    # 佔用列永遠靠前，便於人工辨識風險；其次才是可安全寫入列。
+    opts.extend(occupied_labels)
+    opts.extend(other_occupied)
+    opts.extend(normal_labels)
+    opts.extend(other_normal)
     if not skip_first:
         opts.append(("略過不寫入", None))
     return opts
@@ -848,6 +1179,297 @@ def _session_write_skip_counts(result_df: pd.DataFrame) -> tuple[int, int]:
         elif dt == "skip":
             n_skip += 1
     return n_write, n_skip
+
+
+def _build_report_snapshot_row_from_actions(
+    write_actions: list[dict],
+    executed_at: datetime | None = None,
+    *,
+    cloud_df: pd.DataFrame | None = None,
+) -> list[object]:
+    now = executed_at or datetime.now()
+    ts = now.strftime("%Y-%m-%d %H:%M:%S")
+    ym = now.strftime("%Y-%m")
+
+    dfw = pd.DataFrame(write_actions or [])
+    print(f"[BatchSyncLogs] write_actions columns: {list(dfw.columns)}")
+    total_count = int(len(dfw))
+
+    def _pick_col(candidates: list[str]) -> str | None:
+        for c in candidates:
+            if c in dfw.columns:
+                return c
+        return None
+
+    col_rev = _pick_col(["sale_price", "實售收入", "revenue", "net_sales", "商品原價"])
+    col_fee = _pick_col(["fee_value", "est_fee", "platform_fee", "單件實扣手續費", "賣場手續費"])
+    col_profit = _pick_col(["est_profit_twd", "profit", "最終利潤", "淨利潤"])
+    col_cost = _pick_col(["unit_cost", "original_cost", "單件成本", "原始成本", "cost"])
+
+    rev_s = pd.to_numeric(dfw[col_rev], errors="coerce").fillna(0.0) if col_rev else pd.Series([0.0] * total_count)
+    fee_s = pd.to_numeric(dfw[col_fee], errors="coerce").fillna(0.0) if col_fee else pd.Series([0.0] * total_count)
+    profit_s = pd.to_numeric(dfw[col_profit], errors="coerce").fillna(0.0) if col_profit else pd.Series([0.0] * total_count)
+    if col_cost:
+        cost_s = pd.to_numeric(dfw[col_cost], errors="coerce")
+    else:
+        cost_s = pd.Series([float("nan")] * total_count)
+
+    # 若本地 action 沒成本，依 target_row 直接抓雲端該列單件成本（與填寫流程一致）。
+    if cloud_df is not None and not cloud_df.empty and "target_row" in dfw.columns:
+        for i, tr0 in enumerate(dfw["target_row"].tolist()):
+            if i >= len(cost_s):
+                break
+            if pd.notna(cost_s.iloc[i]) and float(cost_s.iloc[i]) > 0:
+                continue
+            try:
+                tr = int(tr0 or 0)
+            except Exception:
+                tr = 0
+            if tr <= 0:
+                continue
+            r_cloud = get_catalog_row_by_sheet_row(cloud_df, tr)
+            if r_cloud is None:
+                continue
+            c0 = _extract_cost_from_cloud_row(r_cloud)
+            if c0 is not None and c0 > 0:
+                cost_s.iloc[i] = float(c0)
+
+    fallback_s = rev_s - fee_s - profit_s
+    cost_s = cost_s.where(cost_s.notna(), fallback_s).fillna(0.0)
+
+    total_revenue = float(rev_s.sum())
+    total_fee = float(fee_s.sum())
+    total_profit = float(profit_s.sum())
+    total_cost = float(cost_s.sum())
+
+    avg_fee_rate = (total_fee / total_revenue) if total_revenue > 0 else 0.0
+
+    return [
+        ts,
+        ym,
+        total_count,
+        int(round(total_revenue)),
+        int(round(total_fee)),
+        int(round(total_cost)),
+        int(round(total_profit)),
+        round(avg_fee_rate, 6),
+    ]
+
+
+def _append_report_snapshot_row(
+    cred_path: str,
+    spreadsheet_id: str,
+    worksheet_name: str,
+    row_values: list[object],
+) -> None:
+    gc = open_gspread_client(cred_path)
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = None
+    try:
+        ws = sh.worksheet(worksheet_name)
+    except Exception:
+        ws = sh.add_worksheet(
+            title=worksheet_name,
+            rows=2000,
+            cols=max(20, len(REPORT_SNAPSHOT_HEADERS) + 2),
+        )
+    hdr = ws.row_values(1)
+    need_header = (not hdr) or [str(x).strip() for x in hdr[: len(REPORT_SNAPSHOT_HEADERS)]] != REPORT_SNAPSHOT_HEADERS
+    if need_header:
+        ws.update(
+            "A1",
+            [REPORT_SNAPSHOT_HEADERS],
+            value_input_option="USER_ENTERED",
+        )
+    ws.append_row([str(v) if v is not None else "" for v in row_values], value_input_option="USER_ENTERED")
+
+
+def _build_final_report_snapshot(
+    write_actions: list[dict],
+    *,
+    cloud_df: pd.DataFrame,
+    batch_id: str,
+    csv_fp: str,
+    csv_name: str,
+) -> dict[str, object]:
+    """
+    Golden Record：同步當下即固定本批次完整對帳資料。
+    規則：成本必須可由雲端目標列回讀，否則直接報錯中止。
+    """
+    if cloud_df is None or cloud_df.empty:
+        raise ValueError("無法建立戰報快照：雲端目錄未載入。")
+    rows: list[dict[str, object]] = []
+    for a in write_actions:
+        try:
+            tr = int(a.get("target_row", 0) or 0)
+        except Exception:
+            tr = 0
+        if tr <= 0:
+            raise ValueError("無法建立戰報快照：寫入目標列無效。")
+        r_cloud = get_catalog_row_by_sheet_row(cloud_df, tr)
+        cost = _extract_cost_from_cloud_row(r_cloud)
+        if cost is None or cost <= 0:
+            raise ValueError(f"無法建立戰報快照：第 {tr} 列讀不到有效單件成本。")
+        sale = float(a.get("sale_price", 0) or 0)
+        fee = float(a.get("fee_value", 0) or 0)
+        profit = sale - fee - float(cost)
+        fee_rate = (fee / sale) if sale > 0 else 0.0
+        rows.append(
+            {
+                "商品原始名稱": str(a.get("raw_name", "") or "").strip() or f"ROW:{tr}",
+                "實售收入": sale,
+                "成本": float(cost),
+                "成本來源": "✅ 雲端回讀",
+                "手續費": fee,
+                "淨利潤": profit,
+                "手續費率": fee_rate,
+                "目標列": tr,
+            }
+        )
+    df = pd.DataFrame(rows)
+    total_rev = int(round(float(df["實售收入"].sum())))
+    total_fee = int(round(float(df["手續費"].sum())))
+    total_cost = int(round(float(df["成本"].sum())))
+    total_profit = int(round(float(df["淨利潤"].sum())))
+    avg_fee_rate = (float(total_fee) / float(total_rev)) if total_rev > 0 else 0.0
+    return {
+        "batch_id": str(batch_id or ""),
+        "csv_fp": str(csv_fp or ""),
+        "csv_name": str(csv_name or ""),
+        "writes_count": int(len(write_actions)),
+        "total_revenue": total_rev,
+        "total_fee": total_fee,
+        "total_cost": total_cost,
+        "total_profit": total_profit,
+        "avg_fee_rate": avg_fee_rate,
+        "audit_rows": df.to_dict(orient="records"),
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def _build_batch_battle_report(
+    write_actions: list[dict],
+    *,
+    cloud_df: pd.DataFrame | None = None,
+) -> dict[str, object]:
+    """由本次 write actions 產生同步成功頁的戰報資料。"""
+    dfw = pd.DataFrame(write_actions or [])
+    print(f"[BattleReport] write_actions columns: {list(dfw.columns)}")
+
+    def _pick_col(candidates: list[str]) -> str | None:
+        for c in candidates:
+            if c in dfw.columns:
+                return c
+        return None
+
+    col_name = _pick_col(["raw_name", "商品原始名稱", "商品名稱", "合併原始名稱", "name"])
+    col_rev = _pick_col(["sale_price", "實售收入", "revenue", "net_sales", "商品原價"])
+    col_fee = _pick_col(["fee_value", "est_fee", "platform_fee", "單件實扣手續費", "賣場手續費"])
+    col_profit = _pick_col(["est_profit_twd", "profit", "最終利潤", "淨利潤"])
+    col_cost = _pick_col(["unit_cost", "original_cost", "單件成本", "原始成本", "cost"])
+
+    def _clean_num_series(src: pd.Series | object, size: int) -> pd.Series:
+        if isinstance(src, pd.Series):
+            s = src.copy()
+        else:
+            s = pd.Series([src] * size)
+        # 強制清洗：去逗號 + 空值補零 + 非數字字元移除
+        s = (
+            s.astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace(r"[^\d\.\-]", "", regex=True)
+            .replace("", "0")
+            .fillna("0")
+        )
+        return pd.to_numeric(s, errors="coerce").fillna(0.0)
+
+    if dfw.empty:
+        rows_df = pd.DataFrame(columns=["商品原始名稱", "實售收入", "成本", "手續費", "淨利潤", "手續費率"])
+    else:
+        names = (
+            dfw[col_name].fillna("").astype(str).str.strip()
+            if col_name
+            else pd.Series([""] * len(dfw))
+        )
+        names = names.where(names != "", dfw.get("order_uid", "").astype(str).str.slice(0, 8).radd("UID:"))
+        rev_s = _clean_num_series(dfw[col_rev], len(dfw)) if col_rev else pd.Series([0.0] * len(dfw))
+        fee_s = _clean_num_series(dfw[col_fee], len(dfw)) if col_fee else pd.Series([0.0] * len(dfw))
+        local_cost_s = _clean_num_series(dfw[col_cost], len(dfw)) if col_cost else pd.Series([0.0] * len(dfw))
+        cost_s = pd.Series([float("nan")] * len(dfw))
+        cost_source_s = pd.Series(["⚠️ 系統估算"] * len(dfw))
+
+        # 核心修正：優先用 target_row 回抓雲端該列成本（與填寫流程一致）。
+        if cloud_df is not None and not cloud_df.empty and "target_row" in dfw.columns:
+            for i, tr0 in enumerate(dfw["target_row"].tolist()):
+                if i >= len(cost_s):
+                    break
+                if pd.notna(cost_s.iloc[i]) and float(cost_s.iloc[i] or 0) > 0:
+                    continue
+                try:
+                    tr = int(tr0 or 0)
+                except Exception:
+                    tr = 0
+                if tr <= 0:
+                    continue
+                r_cloud = get_catalog_row_by_sheet_row(cloud_df, tr)
+                if r_cloud is None:
+                    continue
+                c0 = _extract_cost_from_cloud_row(r_cloud)
+                if c0 is not None and c0 > 0:
+                    cost_s.iloc[i] = float(c0)
+                    cost_source_s.iloc[i] = "✅ 雲端回讀"
+
+        # 次選：action 本身已帶成本（仍歸類為系統估算，避免誤標雲端回讀）。
+        cost_s = cost_s.where(cost_s.notna(), local_cost_s.where(local_cost_s > 0, pd.NA))
+
+        # 最後：雲端仍取不到才估算。
+        try:
+            target_profit_pct = float(st.session_state.get("amount_tolerance_pct", 25.0) or 25.0) / 100.0
+        except Exception:
+            target_profit_pct = 0.25
+        target_profit_pct = max(0.0, min(1.0, target_profit_pct))
+        fallback_cost_s = (rev_s - fee_s - (rev_s * target_profit_pct)).fillna(0.0)
+        cost_s = cost_s.where(cost_s > 0, fallback_cost_s).fillna(0.0)
+        fee_rate_s = (fee_s / rev_s.where(rev_s != 0, pd.NA)).fillna(0.0)
+        profit_s = (rev_s - fee_s - cost_s).fillna(0.0)
+        rows_df = pd.DataFrame(
+            {
+                "商品原始名稱": names,
+                "實售收入": rev_s,
+                "成本": cost_s,
+                "成本來源": cost_source_s,
+                "手續費": fee_s,
+                "淨利潤": profit_s,
+                "手續費率": fee_rate_s,
+            }
+        )
+
+    total_revenue = float(rows_df["實售收入"].sum()) if not rows_df.empty else 0.0
+    total_fee = float(rows_df["手續費"].sum()) if not rows_df.empty else 0.0
+    total_profit = float(rows_df["淨利潤"].sum()) if not rows_df.empty else 0.0
+    total_cost = float(rows_df["成本"].sum()) if not rows_df.empty else 0.0
+    avg_fee_rate = (total_fee / total_revenue) if total_revenue > 0 else 0.0
+    top_mvp_src = rows_df.sort_values(by="淨利潤", ascending=False).head(3) if not rows_df.empty else rows_df
+    top_fee_src = rows_df.sort_values(by="手續費率", ascending=False).head(3) if not rows_df.empty else rows_df
+    top_mvp_rows_out = [
+        {"商品原始名稱": str(r.get("商品原始名稱", "") or ""), "利潤": int(round(float(r.get("淨利潤", 0) or 0)))}
+        for _, r in top_mvp_src.iterrows()
+    ]
+    top_fee_rows_out = [
+        {"商品原始名稱": str(r.get("商品原始名稱", "") or ""), "手續費率": f"{round(float(r.get('手續費率', 0) or 0) * 100.0, 2):.2f}%"}
+        for _, r in top_fee_src.iterrows()
+    ]
+    return {
+        "writes_count": int(len(write_actions)),
+        "total_revenue": int(round(total_revenue)),
+        "total_fee": int(round(total_fee)),
+        "total_cost": int(round(total_cost)),
+        "avg_fee_rate": float(avg_fee_rate),
+        "total_profit": int(round(total_profit)),
+        "top_mvp_rows": top_mvp_rows_out,
+        "top_fee_rows": top_fee_rows_out,
+        "detail_rows": rows_df.to_dict(orient="records"),
+    }
 
 
 def _staged_actions() -> list[dict]:
@@ -1099,6 +1721,22 @@ def _money_to_int(value: object) -> int | None:
         return None
 
 
+def _money_to_float(value: object) -> float | None:
+    try:
+        if value is None:
+            return None
+        s = str(value).strip()
+        if not s:
+            return None
+        s = s.replace(",", "")
+        m = re.search(r"-?\d+(?:\.\d+)?", s)
+        if not m:
+            return None
+        return float(m.group(0))
+    except Exception:
+        return None
+
+
 def _read_uploaded_report_dataframe(
     raw_bytes: bytes,
     filename: str,
@@ -1134,6 +1772,35 @@ def _to_date_text(value: object) -> str:
     raw = str(value or "").strip()
     if not raw:
         return ""
+    s = (
+        raw.replace("／", "/")
+        .replace("-", "/")
+        .replace(".", "/")
+        .replace("年", "/")
+        .replace("月", "/")
+        .replace("日", "")
+        .strip()
+    )
+    # 常見雲端格式：只填月/日（例如 8/3）→ 以今年補齊
+    md = re.fullmatch(r"(\d{1,2})/(\d{1,2})", s)
+    if md:
+        try:
+            y = datetime.now().year
+            m = int(md.group(1))
+            d = int(md.group(2))
+            return datetime(y, m, d).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    # Excel serial day（例如 45231 / 45231.0）
+    if re.fullmatch(r"\d+(?:\.\d+)?", s):
+        try:
+            n = int(float(s))
+            if 20000 <= n <= 80000:
+                dt0 = pd.to_datetime(n, unit="D", origin="1899-12-30", errors="coerce")
+                if pd.notna(dt0):
+                    return dt0.strftime("%Y-%m-%d")
+        except Exception:
+            pass
     try:
         return pd.to_datetime(raw, errors="coerce").strftime("%Y-%m-%d")
     except Exception:
@@ -1154,6 +1821,12 @@ def _sheet_open_date_text(row: pd.Series | None) -> str:
         "日期",
     ]
     for key in candidates:
+        raw = str(row.get(key, "") or "").strip()
+        dt = _to_date_text(raw)
+        if dt:
+            return dt
+    # 有些工作表把日期放在無標題欄（例如 A 欄 header 為空）
+    for key in ("", " ", "Unnamed: 0"):
         raw = str(row.get(key, "") or "").strip()
         dt = _to_date_text(raw)
         if dt:
@@ -1217,7 +1890,7 @@ def _clear_review_runtime_state() -> None:
         "active_batch_id",
         "active_upload_time",
         "uploaded_file",
-        "show_only_pending",
+        "show_all_rows",
         "history_batch_pick",
         "download_batch_summary_csv",
         "staged_actions",
@@ -1281,6 +1954,98 @@ def _show_user_error(message: str, err: Exception | None = None) -> None:
 
 def main():
     st.set_page_config(page_title="蝦皮訂單預處理", layout="wide")
+    st.markdown(
+        """
+<style>
+/* 主要 CTA：翠綠漸層，傳達「安全、建議執行」，與警示紅區隔 */
+div[data-testid="stButton"] button[kind="primary"] {
+  background: linear-gradient(180deg, #059669 0%, #047857 100%) !important;
+  color: #ffffff !important;
+  border: 1px solid #065f46 !important;
+  font-weight: 600 !important;
+  box-shadow: 0 1px 2px rgba(4, 120, 87, 0.22);
+  transition: transform 0.08s ease, box-shadow 0.12s ease, filter 0.12s ease, border-color 0.12s ease !important;
+}
+div[data-testid="stButton"] button[kind="primary"]:hover:not(:disabled) {
+  background: linear-gradient(180deg, #047857 0%, #065f46 100%) !important;
+  border-color: #064e3b !important;
+  filter: brightness(0.97);
+  box-shadow: 0 2px 6px rgba(4, 120, 87, 0.28);
+}
+div[data-testid="stButton"] button[kind="primary"]:active:not(:disabled) {
+  transform: scale(0.97);
+  box-shadow: 0 1px 2px rgba(4, 120, 87, 0.18);
+}
+div[data-testid="stButton"] button[kind="primary"]:disabled {
+  background: #e5e7eb !important;
+  color: #9ca3af !important;
+  border-color: #d1d5db !important;
+  box-shadow: none !important;
+}
+
+/* Row: net-income metric card + profit panel equal height (both use marker classes) */
+div[data-testid="stHorizontalBlock"]:has(.shopee-fin-metric-card):has(.shopee-fin-compare-panel) {
+  align-items: stretch !important;
+  gap: 0.65rem;
+}
+div[data-testid="stHorizontalBlock"]:has(.shopee-fin-metric-card):has(.shopee-fin-compare-panel) > div[data-testid="column"] {
+  display: flex !important;
+  flex-direction: column !important;
+}
+div[data-testid="stHorizontalBlock"]:has(.shopee-fin-metric-card):has(.shopee-fin-compare-panel) > div[data-testid="column"] > div {
+  flex: 1 1 auto !important;
+  min-height: 0 !important;
+}
+div[data-testid="stHorizontalBlock"]:has(.shopee-fin-metric-card):has(.shopee-fin-compare-panel) [data-testid="stMarkdownContainer"] {
+  height: 100%;
+}
+div[data-testid="stHorizontalBlock"]:has(.shopee-fin-metric-card):has(.shopee-fin-compare-panel) [data-testid="stMarkdownContainer"] > p {
+  height: 100%;
+  margin: 0;
+}
+div[data-testid="stHorizontalBlock"]:has(.shopee-fin-metric-card):has(.shopee-fin-compare-panel) .shopee-fin-metric-card,
+div[data-testid="stHorizontalBlock"]:has(.shopee-fin-metric-card):has(.shopee-fin-compare-panel) .shopee-fin-compare-panel {
+  height: 100%;
+  min-height: 6.85rem;
+  box-sizing: border-box;
+}
+div[data-testid="stHorizontalBlock"]:has(.shopee-fin-metric-card):has(.shopee-fin-compare-panel) .shopee-fin-metric-card {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+div[data-testid="stHorizontalBlock"]:has(.shopee-fin-metric-card):has(.shopee-fin-compare-panel) .shopee-fin-compare-panel {
+  display: flex;
+  flex-direction: column;
+}
+div[data-testid="stHorizontalBlock"]:has(.shopee-fin-metric-card):has(.shopee-fin-compare-panel) .shopee-fin-compare-panel > div:first-child {
+  flex: 1 1 auto;
+}
+
+/* Selectbox hover border */
+div[data-testid="stSelectbox"] [data-baseweb="select"] > div {
+  transition: border-color 0.15s ease, box-shadow 0.15s ease !important;
+}
+div[data-testid="stSelectbox"]:hover [data-baseweb="select"] > div {
+  border-color: #059669 !important;
+  box-shadow: 0 0 0 1px rgba(5, 150, 105, 0.22) !important;
+}
+
+/* Checkbox hover */
+div[data-testid="stCheckbox"] label {
+  transition: color 0.12s ease, background-color 0.12s ease, border-color 0.12s ease !important;
+  border-radius: 6px;
+}
+div[data-testid="stCheckbox"]:hover label {
+  color: #065f46 !important;
+}
+div[data-testid="stCheckbox"]:hover label span[style] {
+  border-color: #059669 !important;
+}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
     st.title("📦 訂單入庫與雲端比對系統")
 
     with st.sidebar:
@@ -1354,12 +2119,20 @@ def main():
         st.markdown("**📤 第三步：上傳報表檔案 (CSV / 加密 XLSX)**")
         uploaded = st.file_uploader("上傳 CSV / XLSX", type=["csv", "xlsx"], key="uploaded_file")
         if uploaded is None:
-            st.info("請完成第二步密碼確認後，於第三步上傳報表檔案。")
-            return
-
-        # getvalue() 可重複讀取；避免只用 read() 後指標在結尾
-        raw_bytes = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
-        csv_name = getattr(uploaded, "name", "unknown.csv")
+            cached_bytes = st.session_state.get("uploaded_file_cached_bytes")
+            cached_name = str(st.session_state.get("uploaded_file_cached_name", "") or "")
+            if isinstance(cached_bytes, (bytes, bytearray)) and cached_name:
+                raw_bytes = bytes(cached_bytes)
+                csv_name = cached_name
+            else:
+                st.info("請完成第二步密碼確認後，於第三步上傳報表檔案。")
+                return
+        else:
+            # getvalue() 可重複讀取；避免只用 read() 後指標在結尾
+            raw_bytes = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
+            csv_name = getattr(uploaded, "name", "unknown.csv")
+            st.session_state["uploaded_file_cached_bytes"] = bytes(raw_bytes)
+            st.session_state["uploaded_file_cached_name"] = str(csv_name)
         csv_fp = _fingerprint_bytes(raw_bytes)
         try:
             df = _read_uploaded_report_dataframe(
@@ -1798,6 +2571,37 @@ def main():
     result = pending_orders
 
     with st.sidebar:
+        if "fx_cny_to_twd" not in st.session_state:
+            st.session_state["fx_cny_to_twd"] = 5.0
+        if "card_extra_pct" not in st.session_state:
+            st.session_state["card_extra_pct"] = 25.0
+        if "amount_tolerance_pct" not in st.session_state:
+            st.session_state["amount_tolerance_pct"] = 25.0
+        with st.expander("💱 利潤比對設定", expanded=False):
+            st.number_input(
+                "自訂匯率（1 CNY = ? TWD）",
+                min_value=0.1,
+                max_value=20.0,
+                step=0.01,
+                format="%.2f",
+                key="fx_cny_to_twd",
+            )
+            st.number_input(
+                "估計調整率（運費%）",
+                min_value=0.0,
+                max_value=100.0,
+                step=0.5,
+                format="%.1f",
+                key="card_extra_pct",
+            )
+            st.number_input(
+                "合理利潤率（%）",
+                min_value=1.0,
+                max_value=100.0,
+                step=1.0,
+                format="%.1f",
+                key="amount_tolerance_pct",
+            )
         st.markdown("##### 🛒 同步與進度")
         st.caption("已啟用本地草稿：刷新頁面可自動恢復未同步暫存。")
         staged_actions = _dedupe_staged_actions_by_uid(_staged_actions())
@@ -1810,6 +2614,9 @@ def main():
         st.caption(
             f"待同步：手動暫存 {manual_count} 筆"
             f"／自動封存 {auto_archive_count} 筆"
+        )
+        st.caption(
+            "系統會自動寫入批次摘要到 Batch_Sync_Logs（無需額外勾選）。"
         )
         if auto_archive_count > 0 and manual_count == 0:
             st.info("目前待同步筆數來自「接管日前封存」自動項目，非手動暫存。")
@@ -1832,30 +2639,58 @@ def main():
                 st.error("目前無法連線歷史紀錄，暫時不能同步。")
             else:
                 try:
-                    writes = [
-                        a for a in staged_actions if str(a.get("action_type", "")).lower() == "write"
-                    ]
-                    write_ops = [
-                        {
-                            "sheet_row": int(a.get("target_row", 0) or 0),
-                            "header_index_1based": dict(a.get("header_index_1based") or {}),
-                            "buyer_account": str(a.get("buyer_account", "") or ""),
-                            "sale_price": a.get("sale_price", ""),
-                            "fee_value": a.get("fee_value", ""),
-                        }
-                        for a in writes
-                    ]
-                    batch_write_order_values_to_sheet_rows(
-                        cred_path,
-                        spreadsheet_id,
-                        worksheet_name.strip(),
-                        write_ops,
-                    )
-                    append_history_actions_batch(
-                        cred_path,
-                        spreadsheet_id,
-                        staged_actions + legacy_archive_actions,
-                    )
+                    with st.spinner("同步中，請稍候..."):
+                        writes = [
+                            a for a in staged_actions if str(a.get("action_type", "")).lower() == "write"
+                        ]
+                        write_ops = [
+                            {
+                                "sheet_row": int(a.get("target_row", 0) or 0),
+                                "header_index_1based": dict(a.get("header_index_1based") or {}),
+                                "buyer_account": str(a.get("buyer_account", "") or ""),
+                                "sale_price": a.get("sale_price", ""),
+                                "fee_value": a.get("fee_value", ""),
+                            }
+                            for a in writes
+                        ]
+                        batch_write_order_values_to_sheet_rows(
+                            cred_path,
+                            spreadsheet_id,
+                            worksheet_name.strip(),
+                            write_ops,
+                        )
+                        append_history_actions_batch(
+                            cred_path,
+                            spreadsheet_id,
+                            staged_actions + legacy_archive_actions,
+                        )
+                        if writes:
+                            final_snapshot = _build_final_report_snapshot(
+                                writes,
+                                cloud_df=cloud_df,
+                                batch_id=str(active_batch_id or ""),
+                                csv_fp=str(csv_fp or ""),
+                                csv_name=str(csv_name or ""),
+                            )
+                            st.session_state["FINAL_REPORT_SNAPSHOT"] = final_snapshot
+                            snapshot_row = [
+                                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                datetime.now().strftime("%Y-%m"),
+                                int(final_snapshot["writes_count"]),
+                                int(final_snapshot["total_revenue"]),
+                                int(final_snapshot["total_fee"]),
+                                int(final_snapshot["total_cost"]),
+                                int(final_snapshot["total_profit"]),
+                                round(float(final_snapshot["avg_fee_rate"]), 6),
+                            ]
+                            _append_report_snapshot_row(
+                                cred_path,
+                                spreadsheet_id,
+                                DEFAULT_REPORT_SNAPSHOT_WORKSHEET,
+                                snapshot_row,
+                            )
+                        else:
+                            st.session_state["FINAL_REPORT_SNAPSHOT"] = None
                     local_map_now = dict(st.session_state.get("local_synced_action_map") or {})
                     for a in (staged_actions + legacy_archive_actions):
                         uid_now = str(a.get("order_uid", "") or "").strip()
@@ -1882,12 +2717,25 @@ def main():
                     st.session_state["history_cache_dirty"] = True
                     st.session_state["force_history_sync"] = True
                     st.session_state["sku_dictionary_dirty"] = True
+                    st.session_state["sync_success_payload"] = {
+                        "csv_fp": str(csv_fp or ""),
+                        "batch_id": str(active_batch_id or ""),
+                        "manual_count": int(len(staged_actions)),
+                        "archive_count": int(len(legacy_archive_actions)),
+                        "writes_count": int(len(writes)),
+                    }
                     st.balloons()
                     st.success(
                         "✅ 本次同步完成："
                         f"一般 {len(staged_actions)} 筆，"
                         f"封存 {len(legacy_archive_actions)} 筆。"
                     )
+                    if writes:
+                        st.caption(
+                            f"📊 已自動寫入批次結算摘要：{DEFAULT_REPORT_SNAPSHOT_WORKSHEET}"
+                        )
+                    else:
+                        st.caption("ℹ️ 本次同步皆為略過，未產生新的批次摘要。")
                     st.rerun()
                 except Exception as e:
                     _show_user_error("同步失敗，請稍後再試。", e)
@@ -1988,9 +2836,9 @@ def main():
     p2.metric("已同步寫入", done_write_count)
     p3.metric("已同步略過", done_skip_count)
     p4.metric("尚待處理", pending_review_count)
-    if "show_only_pending" not in st.session_state:
-        st.session_state["show_only_pending"] = True
-    show_only_pending = st.checkbox("只顯示未完成（建議開啟）", key="show_only_pending")
+    if "show_all_rows" not in st.session_state:
+        st.session_state["show_all_rows"] = False
+    show_all_rows = st.checkbox("顯示所有（含已完成）", key="show_all_rows")
     if "enable_low_conf_hint" not in st.session_state:
         st.session_state["enable_low_conf_hint"] = True
     if "same_buyer_high_threshold" not in st.session_state:
@@ -2106,6 +2954,8 @@ def main():
                 row_uid = str(row.get("uid", ""))
                 tag = str(row.get("現貨預定標記", "") or "")
                 candidate_df = candidate_pool_for_stock_tag(cloud_df, tag)
+                # 「展開所有」不受預定/現貨平台池限制，提供全表候選供人工挑選。
+                candidate_df_all = cloud_df.copy()
                 q = str(row.get("清洗後簡體名稱", "") or "")
                 raw_nm = str(row.get("合併原始名稱", "") or "").strip()
                 top_matches = fuzzy_top3_matches(q, candidate_df)
@@ -2125,6 +2975,7 @@ def main():
                                 for sr, score, merged in fuzzy_top3_matches(q, buyer_pool):
                                     if int(score) < same_buyer_high_threshold:
                                         continue
+                                    row_hit = get_catalog_row_by_sheet_row(cloud_df, int(sr))
                                     buyer_high_hits.append(
                                         {
                                             "sheet_row": str(int(sr)),
@@ -2133,8 +2984,13 @@ def main():
                                                 str(merged or "").replace("\n", " ").strip(),
                                                 "zh-tw",
                                             ),
+                                            "buyer": str(
+                                                (row_hit.get("買家", "") if row_hit is not None else "")
+                                                or ""
+                                            ).strip()
+                                            or "（空白）",
                                             "upload_time": _sheet_open_date_text(
-                                                get_catalog_row_by_sheet_row(cloud_df, int(sr))
+                                                row_hit
                                             ),
                                         }
                                     )
@@ -2144,7 +3000,7 @@ def main():
                         raw_nm, q, candidate_df, sku_dict_map
                     ),
                     "all_options": _build_all_pick_options(
-                        candidate_df, raw_nm, sku_dict_map, skip_first=True
+                        candidate_df_all, raw_nm, sku_dict_map, skip_first=True
                     ),
                     "top_score": top_score,
                     "buyer_high_hits": buyer_high_hits[:same_buyer_hint_max_hits],
@@ -2163,7 +3019,7 @@ def main():
         done_key = f"done_{uid}"
         done = bool(st.session_state.get(done_key, False))
         done_type = str(st.session_state.get(f"done_type_{uid}", "") or "")
-        if show_only_pending and done:
+        if (not show_all_rows) and done:
             continue
         buyer = row.get("買家帳號", "")
         tag = row.get("現貨預定標記", "")
@@ -2186,7 +3042,7 @@ def main():
             row_uid = str(row.get("uid", ""))
 
             if staged_action is not None:
-                st.info("🛒 這筆已加入待提交佇列，尚未寫入雲端。")
+                st.info("🛒 這筆已加入同步佇列，尚未寫入雲端。")
                 expected_platform = expected_platform_for_stock_tag(str(tag or ""))
                 left_bg, left_fg = _left_tag_badge_colors(str(tag or ""))
                 right_bg, right_fg = _right_platform_badge_colors(expected_platform)
@@ -2341,12 +3197,17 @@ def main():
             all_options = review_meta[uid]["all_options"]
             top_score = int(review_meta[uid].get("top_score", 0) or 0)
             buyer_high_hits = list(review_meta[uid].get("buyer_high_hits", []) or [])
+            fx_cny_to_twd = float(st.session_state.get("fx_cny_to_twd", 5.0) or 5.0)
+            card_extra_pct = float(st.session_state.get("card_extra_pct", 25.0) or 0.0)
+            reasonable_profit_pct = float(st.session_state.get("amount_tolerance_pct", 25.0) or 25.0)
+            shopee_twd = _money_to_int(row.get("商品原價", ""))
 
-            left_c, right_c = st.columns([1, 1])
+            expected_platform = expected_platform_for_stock_tag(str(tag or ""))
+            left_bg, left_fg = _left_tag_badge_colors(str(tag or ""))
+            right_bg, right_fg = _right_platform_badge_colors(expected_platform)
+            left_c, right_c = st.columns([1.03, 0.97])
             with left_c:
                 st.caption("商品與訂單")
-                expected_platform = expected_platform_for_stock_tag(str(tag or ""))
-                left_bg, left_fg = _left_tag_badge_colors(str(tag or ""))
                 st.markdown(
                     _tag_badge_html(
                         f"來源判定：{tag or '未知'}",
@@ -2359,12 +3220,95 @@ def main():
                     _name_panel_html("蝦皮商品名稱", merged_disp, min_height_px=92),
                     unsafe_allow_html=True,
                 )
-                st.metric("單件實扣手續費", f"{fee_int}")
+                net_income = (
+                    int(shopee_twd) - int(fee_int)
+                    if shopee_twd is not None
+                    else None
+                )
+                price_l, price_r = st.columns([1.05, 1.08])
+                with price_l:
+                    st.markdown(
+                        _metric_block_html(
+                            "實售收入（實售金額-手續費）",
+                            f"{int(net_income):,}" if net_income is not None else "—",
+                            tone="#0f766e",
+                            value_size="lg",
+                            html_class="shopee-fin-metric-card",
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                with price_r:
+                    amount_gap_hint_slot = st.empty()
+                recv_l, recv_r = st.columns([1.0, 1.08])
+                with recv_l:
+                    st.markdown(
+                        _metric_block_html(
+                            "實收金額（台幣）",
+                            f"{int(shopee_twd):,}" if shopee_twd is not None else "—",
+                            tone="#111827",
+                            value_size="md",
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                with recv_r:
+                    suggest_price_hint_slot = st.empty()
+                fee_pct = (
+                    (float(fee_int) / float(shopee_twd)) * 100.0
+                    if (shopee_twd is not None and float(shopee_twd) > 0)
+                    else None
+                )
+                fee_tone = "#c2410c"
+                fee_l, fee_r = st.columns([1.0, 1.08])
+                with fee_l:
+                    st.markdown(
+                        _metric_block_html(
+                            "單件實扣手續費",
+                            f"{int(fee_int):,}",
+                            tone=fee_tone,
+                            value_size="md",
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                with fee_r:
+                    if fee_pct is None:
+                        st.markdown(
+                            (
+                                "<div style='margin-top:1.55rem;'>"
+                                "<span style='display:inline-block;padding:0.26rem 0.62rem;border-radius:999px;"
+                                "background:#f3f4f6;color:#6b7280;font-weight:700;'>"
+                                "手續費率 —"
+                                "</span></div>"
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        st.markdown(
+                            (
+                                f"<div style='margin-top:1.55rem;'>"
+                                f"<span style='display:inline-block;padding:0.26rem 0.62rem;border-radius:999px;"
+                                f"background:#f9fafb;border:1px solid #e5e7eb;color:{fee_tone};font-weight:700;'>"
+                                f"手續費率 {fee_pct:.1f}%"
+                                f"</span></div>"
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                profit_l, profit_r = st.columns([1.0, 1.08])
+                with profit_l:
+                    profit_metric_slot = st.empty()
+                    profit_metric_slot.markdown(
+                        _metric_block_html(
+                            "利潤（台幣）",
+                            "—",
+                            tone="#047857",
+                            value_size="hero",
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                with profit_r:
+                    compare_inline_slot = st.empty()
 
             with right_c:
                 st.caption("比對與決策")
-                expected_platform = expected_platform_for_stock_tag(str(tag or ""))
-                right_bg, right_fg = _right_platform_badge_colors(expected_platform)
                 st.markdown(
                     _tag_badge_html(
                         f"候選平台：{expected_platform}",
@@ -2392,7 +3336,7 @@ def main():
                     st.session_state.pop(f"cloud_sel_{uid}", None)
                     st.session_state[mode_key] = bool(show_all_available)
 
-                options = all_options if show_all_available else top_options
+                base_options = all_options if show_all_available else top_options
                 blocked_rows: set[int] = set()
                 for a in staged_actions:
                     if str(a.get("action_type", "") or "").strip().lower() != "write":
@@ -2407,12 +3351,44 @@ def main():
                     if tr_int > 0:
                         blocked_rows.add(tr_int)
                 occupied_rows: set[int] = set()
-                for _, sr0 in options:
+                for _, sr0 in base_options:
                     if not isinstance(sr0, int) or sr0 <= 0:
                         continue
                     r_cand = get_catalog_row_by_sheet_row(cloud_df, sr0)
                     if row_has_order_like_data(r_cand):
                         occupied_rows.add(sr0)
+                if show_all_available:
+                    options = list(base_options)
+                else:
+                    # 推薦模式：僅列出「可安全寫入」的空位，避免推薦到已有資料列。
+                    options: list[tuple[str, int | None]] = []
+                    for label0, sr0 in top_options:
+                        if sr0 is None:
+                            options.append((label0, sr0))
+                            continue
+                        if (
+                            isinstance(sr0, int)
+                            and sr0 > 0
+                            and sr0 not in blocked_rows
+                            and sr0 not in occupied_rows
+                        ):
+                            options.append((label0, sr0))
+                    if not options:
+                        options = [("略過不寫入", None)]
+                # 將「雲端已佔用」或「本地暫存已占用(blocked)」列統一加前綴，
+                # 避免使用者看不出 25/26 這類不可直接寫入的候選列。
+                normalized_options: list[tuple[str, int | None]] = []
+                for lb0, sr0 in options:
+                    lb = str(lb0 or "")
+                    if (
+                        isinstance(sr0, int)
+                        and sr0 > 0
+                        and (sr0 in occupied_rows or sr0 in blocked_rows)
+                        and not lb.startswith("[⚠️ 已佔用]")
+                    ):
+                        lb = f"[⚠️ 已佔用] {lb}"
+                    normalized_options.append((lb, sr0))
+                options = normalized_options
                 default_pick_index = (
                     None
                     if show_all_available
@@ -2433,12 +3409,8 @@ def main():
                         needs_reset = True
                     elif cur_idx < 0 or cur_idx >= len(options):
                         needs_reset = True
-                    else:
-                        cur_sr = options[cur_idx][1]
-                        if isinstance(cur_sr, int) and (
-                            cur_sr in blocked_rows or cur_sr in occupied_rows
-                        ):
-                            needs_reset = True
+                    # 不要因為「已占用/被阻擋」而覆寫使用者手動選擇；
+                    # 只在無值或索引失效時才回到預設推薦列。
                     if needs_reset and default_pick_index is not None:
                         st.session_state[sel_key] = int(default_pick_index)
                 labels = [o[0] for o in options]
@@ -2488,12 +3460,199 @@ def main():
                     plat = str(r_preview.get("平台", "") or "").strip() or "空白"
                     buyer_now = str(r_preview.get("買家", "") or "").strip() or "空白"
                     full_name = _catalog_full_name(r_preview)
+                    card_cny = _money_to_float(r_preview.get("刷卡金額", ""))
+                    unit_cost_twd = _money_to_float(r_preview.get("單件成本", ""))
+                    has_unit_cost = unit_cost_twd is not None and float(unit_cost_twd) > 0
+                    base_twd = (
+                        float(card_cny) * fx_cny_to_twd
+                        if card_cny is not None
+                        else None
+                    )
+                    est_twd = (
+                        int(round(float(unit_cost_twd)))
+                        if has_unit_cost
+                        else (
+                            int(round(float(base_twd) * (1.0 + (card_extra_pct / 100.0))))
+                            if base_twd is not None
+                            else None
+                        )
+                    )
                     with quick_compare_slot:
                         if full_name:
                             st.markdown(
                                 _name_panel_html("雲端完整品項（快速對照）", full_name, min_height_px=92),
                                 unsafe_allow_html=True,
                             )
+                        amt_l, amt_r = st.columns([1.05, 1.3])
+                        with amt_l:
+                            st.markdown(
+                                _metric_block_html(
+                                    "單件成本（台幣）" if has_unit_cost else "粗估計算成本（台幣）",
+                                    f"{int(est_twd):,}" if est_twd is not None else "—",
+                                    tone="#1e40af",
+                                    value_size="lg",
+                                ),
+                                unsafe_allow_html=True,
+                            )
+                        with amt_r:
+                            if has_unit_cost:
+                                st.markdown(
+                                    "<div style='margin-top:0.35rem;font-size:0.80rem;color:#98A2B3;'>"
+                                    "已使用雲端單件成本（實際成本），不套用左側利潤比對設定。"
+                                    "</div>",
+                                    unsafe_allow_html=True,
+                                )
+                            elif card_cny is not None:
+                                st.markdown(
+                                    "<div style='margin-top:0.28rem;padding:8px 10px;border-radius:10px;"
+                                    "border:1px solid #e5e7eb;background:#ffffff;'>"
+                                    "<div style='font-size:0.74rem;color:#94a3b8;line-height:1.2;'>刷卡金額（人民幣）</div>"
+                                    f"<div style='margin-top:2px;font-size:1.02rem;font-weight:900;color:#334155;line-height:1.25;'>¥{float(card_cny):,.2f}</div>"
+                                    "<div style='font-size:0.74rem;color:#64748b;margin-top:4px;line-height:1.45;'>"
+                                    "依左側"
+                                    "<span style='display:inline-block;margin:0 0.24rem;padding:0.10rem 0.42rem;"
+                                    "border:1px solid #D0D5DD;border-radius:6px;background:#F8FAFC;"
+                                    "color:#344054;font-weight:800;letter-spacing:0.01em;'>"
+                                    "【利潤比對設定】"
+                                    "</span>"
+                                    "估算成本"
+                                    "</div>"
+                                    "</div>",
+                                    unsafe_allow_html=True,
+                                )
+                            else:
+                                st.markdown(
+                                    "<div style='margin-top:0.35rem;font-size:0.80rem;color:#98A2B3;'>"
+                                    "刷卡金額（人民幣）：空白/無法解析"
+                                    "</div>",
+                                    unsafe_allow_html=True,
+                                )
+                    if shopee_twd is not None and est_twd is not None:
+                        amount_gap_abs = abs(int(shopee_twd) - int(est_twd))
+                        amount_gap_pct = (
+                            float(amount_gap_abs) / max(1.0, float(shopee_twd))
+                        ) * 100.0
+                        # 額外防呆：金額差距過大通常代表配錯商品或成本資料異常
+                        amount_gap_warn = amount_gap_pct >= 60.0
+                        est_profit = int(shopee_twd) - int(fee_int) - int(est_twd)
+                        net_income_den = max(
+                            1.0, float(int(shopee_twd) - int(fee_int))
+                        )
+                        est_profit_pct = (float(est_profit) / net_income_den) * 100.0
+                        if est_profit > 0:
+                            p_tone = "#047857"
+                        elif est_profit < 0:
+                            p_tone = "#b91c1c"
+                        else:
+                            p_tone = "#b45309"
+                        profit_metric_slot.markdown(
+                            _metric_block_html(
+                                "利潤（台幣）",
+                                f"{est_profit:,}",
+                                tone=p_tone,
+                                value_size="hero",
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                        if est_profit_pct < reasonable_profit_pct:
+                            suggest_footer = ""
+                            if float(shopee_twd or 0) > 0:
+                                k_fee = float(fee_int) / float(shopee_twd)
+                                p_need = _min_selling_price_for_target_profit_pct(
+                                    float(est_twd),
+                                    k_fee,
+                                    reasonable_profit_pct,
+                                )
+                                if p_need is not None:
+                                    p_sug = int(math.ceil(p_need - 1e-9))
+                                    hint_body = (
+                                        f"試算假設：手續費占實收比例維持本筆 {k_fee * 100:.1f}%"
+                                        "（單件實扣÷實收），目標為左側「合理利潤率」"
+                                        f"{reasonable_profit_pct:.1f}%（利潤÷實售收入）。"
+                                        "實際蝦皮費率可能變動，僅供參考。"
+                                    )
+                                    hint_title = html.escape(hint_body, quote=True)
+                                    suggest_footer = _suggested_price_footer_html(
+                                        p_sug, hint_title
+                                    )
+                                else:
+                                    suggest_footer = (
+                                        "<div style='font-size:0.74rem;color:#64748b;line-height:1.45;'>"
+                                        "在目前手續費率與目標利潤率組合下，無法僅靠調高售價達成目標（分母 ≤ 0）。"
+                                        "請檢視成本、目標利潤率或費率假設。"
+                                        "</div>"
+                                    )
+                            if est_profit < 0:
+                                panel_kind = "danger"
+                                panel_title = f"⛔ 估算利潤為負（{est_profit_pct:.1f}%）"
+                                panel_sub = "依據利潤比對設定判斷（需為正利潤）"
+                            elif est_profit == 0:
+                                panel_kind = "warning"
+                                panel_title = f"⚠️ 估算利潤為零（{est_profit_pct:.1f}%）"
+                                panel_sub = "依據利潤比對設定判斷（需為正利潤）"
+                            else:
+                                panel_kind = "warning"
+                                panel_title = f"⚠️ 估算利潤偏低（{est_profit_pct:.1f}%）"
+                                panel_sub = (
+                                    f"依據利潤比對設定判斷（建議 ≥ {reasonable_profit_pct:.1f}%）"
+                                )
+                            compare_inline_slot.markdown(
+                                _profit_analysis_panel(
+                                    panel_kind,
+                                    panel_title,
+                                    panel_sub,
+                                    "",
+                                ),
+                                unsafe_allow_html=True,
+                            )
+                            if suggest_footer:
+                                suggest_price_hint_slot.markdown(
+                                    suggest_footer,
+                                    unsafe_allow_html=True,
+                                )
+                            else:
+                                suggest_price_hint_slot.empty()
+                        else:
+                            compare_inline_slot.markdown(
+                                _profit_alert_card(
+                                    "success",
+                                    f"✅ 估算利潤健康（{est_profit_pct:.1f}%）",
+                                    f"依據利潤比對設定判斷（已達 ≥ {reasonable_profit_pct:.1f}%）",
+                                ),
+                                unsafe_allow_html=True,
+                            )
+                            suggest_price_hint_slot.empty()
+                        if amount_gap_warn:
+                            amount_gap_hint_slot.markdown(
+                                _amount_gap_hint_html(
+                                    int(shopee_twd),
+                                    int(est_twd),
+                                    amount_gap_pct,
+                                ),
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            amount_gap_hint_slot.empty()
+                    else:
+                        profit_metric_slot.markdown(
+                            _metric_block_html(
+                                "利潤（台幣）",
+                                "—",
+                                tone="#64748b",
+                                value_size="hero",
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                        compare_inline_slot.markdown(
+                            _profit_alert_card(
+                                "neutral",
+                                "⏳ 尚無法判斷",
+                                "依據利潤比對設定判斷（待估算利潤）",
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                        amount_gap_hint_slot.empty()
+                        suggest_price_hint_slot.empty()
                     if enable_low_conf_hint and buyer_high_hits:
                         with st.expander("更多參考資訊", expanded=True):
                             st.warning(
@@ -2501,9 +3660,19 @@ def main():
                                 "請先確認是否已填過："
                             )
                             for h in buyer_high_hits:
+                                try:
+                                    sr_i = int(str(h.get("sheet_row", "") or "0"))
+                                except Exception:
+                                    sr_i = 0
+                                row_hit_now = (
+                                    get_catalog_row_by_sheet_row(cloud_df, sr_i)
+                                    if sr_i > 0
+                                    else None
+                                )
+                                open_date_now = _sheet_open_date_text(row_hit_now)
                                 st.caption(
                                     f"- 第 {h['sheet_row']} 列｜分數 {h['score']}｜"
-                                    f"{h['name']}｜開單日期 {h['upload_time']}"
+                                    f"{h['name']}｜買家 {h.get('buyer', '（空白）')}｜開單日期 {open_date_now}"
                                 )
                     plat_raw = str(r_preview.get("平台", "") or "").strip()
                     buyer_raw = str(r_preview.get("買家", "") or "").strip()
@@ -2524,6 +3693,36 @@ def main():
                             _name_panel_html("雲端完整品項（快速對照）", "目前尚未選取目標列。", min_height_px=92),
                             unsafe_allow_html=True,
                         )
+                        st.markdown(
+                            _metric_block_html(
+                                "單件成本（台幣）",
+                                "—",
+                                tone="#1e40af",
+                                value_size="lg",
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                        st.markdown(
+                            "<div style='margin-top:0.35rem;font-size:0.80rem;color:#98A2B3;'>刷卡金額（人民幣）：尚未選取目標列</div>",
+                            unsafe_allow_html=True,
+                        )
+                    profit_metric_slot.markdown(
+                        _metric_block_html(
+                            "利潤（台幣）",
+                            "—",
+                            tone="#64748b",
+                            value_size="hero",
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                    compare_inline_slot.markdown(
+                        _profit_alert_card(
+                            "neutral",
+                            "⏳ 尚無法判斷",
+                            "依據利潤比對設定判斷（待估算利潤）",
+                        ),
+                        unsafe_allow_html=True,
+                    )
                     st.caption("目前此列狀態：未選取目標列")
 
             if manual:
@@ -2547,12 +3746,6 @@ def main():
             )
             occupied = row_has_order_like_data(r_target)
 
-            if occupied and eff_now is not None:
-                st.checkbox(
-                    "強制覆蓋已有資料（此行已有買家／售價／手續費）",
-                    key=f"force_write_{uid}",
-                )
-
             force_ok = (not occupied) or bool(
                 st.session_state.get(f"force_write_{uid}", False)
             )
@@ -2571,6 +3764,10 @@ def main():
                     st.session_state.get(f"force_write_{uid}", False)
                 ):
                     st.error("無法寫入：此列已有資料，請勾選「強制覆蓋」後再確認寫入。")
+                    st.checkbox(
+                        "強制覆蓋已有資料（此行已有買家／售價／手續費）",
+                        key=f"force_write_{uid}",
+                    )
 
                 if action_kind == "skip":
                     clicked_action = st.button(
@@ -2630,7 +3827,7 @@ def main():
                     _set_staged_actions(keep)
                     st.session_state[done_key] = True
                     st.session_state[f"done_type_{uid}"] = "skip"
-                    st.success("已加入待提交佇列（略過）。")
+                    st.success("已加入同步佇列（略過暫存）。")
                     st.rerun()
                 except Exception as e:
                     _show_user_error("暫存略過失敗，請稍後再試。", e)
@@ -2658,6 +3855,13 @@ def main():
                     raw_learn = str(row.get("合併原始名稱", "") or "").strip()
                     std_kw = merged_standard_keyword_from_catalog_row(r_target)
                     prev_dict_kw = str((st.session_state.get("sku_dictionary_cache") or {}).get(raw_learn, "") or "")
+                    try:
+                        est_profit_num = float(est_profit) if est_profit is not None else 0.0
+                    except Exception:
+                        est_profit_num = 0.0
+                    unit_cost_num = _money_to_float(row.get("單件成本", ""))
+                    if unit_cost_num is None:
+                        unit_cost_num = _money_to_float(row.get("原始成本", ""))
                     new_action = {
                         "batch_id": active_batch_id,
                         "upload_time": active_upload_time,
@@ -2672,6 +3876,9 @@ def main():
                         "buyer_account": str(row.get("買家帳號", "") or ""),
                         "sale_price": float(row.get("商品原價", 0) or 0),
                         "fee_value": int(row.get("單件實扣手續費", 0) or 0),
+                        "est_profit_twd": est_profit_num,
+                        "unit_cost": unit_cost_num,
+                        "original_cost": row.get("單件成本", row.get("原始成本", "")),
                         "std_keyword": std_kw,
                         "prev_dict_keyword": prev_dict_kw,
                         "before_local": before_vals,
@@ -2694,7 +3901,7 @@ def main():
                     _set_staged_actions(keep)
                     st.session_state[done_key] = True
                     st.session_state[f"done_type_{uid}"] = "write"
-                    st.success("✅ 已加入待提交佇列（寫入）。")
+                    st.success("✅ 已加入同步佇列（寫入暫存）。")
                     st.rerun()
                 except Exception as e:
                     _show_user_error("暫存寫入失敗，請稍後再試。", e)
@@ -2713,14 +3920,20 @@ def main():
     )
     st.progress(0 if total_cards == 0 else committed_count / total_cards)
     st.caption(
-        f"本次處理進度：已提交 {committed_count}/{total_cards} 筆"
-        + (f"（另有 {staged_count} 筆待提交）" if staged_count else "")
+        f"狀態：已加入同步佇列 {committed_count}/{total_cards} 筆"
+        + (f"（另有 {staged_count} 筆待確認）" if staged_count else "")
     )
 
     all_done = total_cards > 0 and committed_count >= total_cards and staged_count == 0
-    if all_done:
+    success_payload = st.session_state.get("sync_success_payload")
+    payload_match = (
+        isinstance(success_payload, dict)
+        and str(success_payload.get("csv_fp", "") or "") == str(csv_fp or "")
+    )
+    show_success_panel = bool(all_done or payload_match)
+    if show_success_panel:
         celeb_key = f"batch_done_balloons_{csv_fp}_{active_batch_id or 'na'}"
-        if not st.session_state.get(celeb_key, False):
+        if all_done and not st.session_state.get(celeb_key, False):
             st.balloons()
             st.session_state[celeb_key] = True
         st.success("🎉 本批次所有訂單皆已處理完畢！")
@@ -2747,6 +3960,249 @@ def main():
         mc1.metric("總訂單數", total_cards)
         mc2.metric("成功寫入", n_write)
         mc3.metric("略過", n_skip)
+        final_snapshot = st.session_state.get("FINAL_REPORT_SNAPSHOT")
+        if (
+            isinstance(final_snapshot, dict)
+            and int(final_snapshot.get("writes_count", 0) or 0) > 0
+            and str(final_snapshot.get("csv_fp", "") or "") == str(csv_fp or "")
+        ):
+            with st.expander("🏆 檢視本批次結算戰報 (點擊展開)", expanded=False):
+                rows_df = pd.DataFrame(final_snapshot.get("audit_rows") or [])
+
+                if not rows_df.empty:
+                    total_rev = int(round(pd.to_numeric(rows_df["實售收入"], errors="coerce").fillna(0.0).sum()))
+                    total_fee = int(round(pd.to_numeric(rows_df["手續費"], errors="coerce").fillna(0.0).sum()))
+                    total_cost = int(round(pd.to_numeric(rows_df["成本"], errors="coerce").fillna(0.0).sum()))
+                    total_profit = int(round(pd.to_numeric(rows_df["淨利潤"], errors="coerce").fillna(0.0).sum()))
+                    avg_fee_rate = (float(total_fee) / float(total_rev)) if total_rev > 0 else 0.0
+                else:
+                    total_rev = int(final_snapshot.get("total_revenue", 0) or 0)
+                    total_fee = int(final_snapshot.get("total_fee", 0) or 0)
+                    total_cost = int(final_snapshot.get("total_cost", 0) or 0)
+                    avg_fee_rate = float(final_snapshot.get("avg_fee_rate", 0.0) or 0.0)
+                    total_profit = int(final_snapshot.get("total_profit", 0) or 0)
+                margin_pct = (float(total_profit) / float(total_rev) * 100.0) if total_rev > 0 else 0.0
+                rank_text = "🥇 Rank A：穩定輸出！健康的營運批次。"
+                rank_color = "#2563eb"
+                if margin_pct > 20:
+                    rank_text = "🏆 Rank S：暴利收割機！本批次利潤極佳！"
+                    rank_color = "#047857"
+                elif 10 <= margin_pct <= 20:
+                    rank_text = "🥇 Rank A：穩定輸出！健康的營運批次。"
+                    rank_color = "#2563eb"
+                elif 5 <= margin_pct < 10:
+                    rank_text = "⚠️ Rank B：薄利多銷。留意潛在的成本波動。"
+                    rank_color = "#b45309"
+                elif margin_pct < 5:
+                    rank_text = "🚨 Rank C：蝦皮打工仔警報！利潤過低，請立刻檢視手續費與定價！"
+                    rank_color = "#b91c1c"
+                st.markdown(
+                    (
+                        "<div style='border:1px solid #e5e7eb;border-radius:12px;padding:10px 12px;"
+                        "background:linear-gradient(135deg,#f8fafc 0%,#ffffff 100%);margin-bottom:10px;'>"
+                        f"<div style='font-size:1.05rem;font-weight:900;color:{rank_color};'>{html.escape(rank_text)}</div>"
+                        f"<div style='font-size:0.82rem;color:#64748b;margin-top:3px;'>毛利率：{margin_pct:.2f}%</div>"
+                        "</div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
+
+                left_metrics, right_chart = st.columns([1.35, 1.0])
+                with left_metrics:
+                    h1, h2, h3, h4 = st.columns(4)
+                    with h1:
+                        st.markdown(
+                            _battle_metric_card_html(
+                                "💰 總實收",
+                                f"{total_rev:,}",
+                                "TWD",
+                                accent="#0f172a",
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                    with h2:
+                        st.markdown(
+                            _battle_metric_card_html(
+                                "💸 總手續費",
+                                f"{total_fee:,}",
+                                "TWD",
+                                accent="#7c2d12",
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                    with h3:
+                        fee_title = "📊 平均費率 ⚠️" if (avg_fee_rate * 100.0) > 11.0 else "📊 平均費率"
+                        st.markdown(
+                            _battle_metric_card_html(
+                                fee_title,
+                                f"{avg_fee_rate * 100.0:.2f}",
+                                "%",
+                                accent="#1d4ed8",
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                    with h4:
+                        badge_text = f"毛利率 {margin_pct:.1f}%"
+                        badge_bg = "#dcfce7" if total_profit >= 0 else "#fee2e2"
+                        badge_fg = "#166534" if total_profit >= 0 else "#b91c1c"
+                        st.markdown(
+                            _battle_metric_card_html(
+                                "🏆 淨利潤",
+                                f"{total_profit:,}",
+                                "TWD",
+                                accent="#047857" if total_profit >= 0 else "#b91c1c",
+                                badge_text=badge_text,
+                                badge_bg=badge_bg,
+                                badge_fg=badge_fg,
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                with right_chart:
+                    # donut 不接受負值，淨利若為負，圖中以 0 顯示並在下方提示。
+                    donut_profit = max(0, int(total_profit))
+                    if go is not None:
+                        fig = go.Figure(
+                            data=[
+                                go.Pie(
+                                    labels=["總成本", "總手續費", "總淨利潤"],
+                                    values=[max(0, int(total_cost)), max(0, int(total_fee)), donut_profit],
+                                    hole=0.62,
+                                    marker=dict(colors=["#64748b", "#f59e0b", "#10b981"]),
+                                    textinfo="label+percent",
+                                )
+                            ]
+                        )
+                        fig.update_layout(
+                            margin=dict(l=0, r=0, t=6, b=0),
+                            paper_bgcolor="rgba(0,0,0,0)",
+                            plot_bgcolor="rgba(0,0,0,0)",
+                            showlegend=False,
+                        )
+                        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+                    else:
+                        st.caption("ℹ️ 未安裝 plotly，暫以文字版營收結構顯示。")
+                        st.dataframe(
+                            pd.DataFrame(
+                                [
+                                    {"項目": "總成本", "金額 (TWD)": f"{max(0, int(total_cost)):,}"},
+                                    {"項目": "總手續費", "金額 (TWD)": f"{max(0, int(total_fee)):,}"},
+                                    {"項目": "總淨利潤", "金額 (TWD)": f"{donut_profit:,}"},
+                                ]
+                            ),
+                            hide_index=True,
+                            width="stretch",
+                            height=145,
+                        )
+                    if total_profit < 0:
+                        st.caption("⚠️ 本批次淨利為負，圓餅圖之淨利扇區以 0 呈現。")
+
+                st.divider()
+                if rows_df.empty:
+                    st.info("目前僅有摘要資料，未能取得本批次明細項目，行動洞察暫不可用。")
+                else:
+                    low_profit_df = rows_df[rows_df["淨利潤"] < 0].copy()
+                    high_fee_df = rows_df[rows_df["手續費率"] > 0.13].copy()
+                    guardians_df = rows_df.reindex(
+                        rows_df["淨利潤"].abs().sort_values(ascending=False).index
+                    ).head(2).copy()
+
+                    st.markdown("#### 🧭 營運行動清單")
+                    if not low_profit_df.empty:
+                        st.error("🩸 做白工/虧損清單：強烈建議調漲售價。")
+                        low_profit_show = (
+                            low_profit_df[["商品原始名稱", "淨利潤"]]
+                            .rename(columns={"淨利潤": "利潤 (TWD)"})
+                            .assign(**{"利潤 (TWD)": lambda d: d["利潤 (TWD)"].round(0).astype(int)})
+                        )
+                        with st.expander(f"🩸 查看做白工/虧損清單（{len(low_profit_show)} 筆）", expanded=False):
+                            st.dataframe(
+                                low_profit_show,
+                                hide_index=True,
+                                width="stretch",
+                                height=170,
+                            )
+                            st.download_button(
+                                label="下載做白工/虧損清單 (CSV)",
+                                data=low_profit_show.to_csv(index=False).encode("utf-8-sig"),
+                                file_name="audit_low_profit_list.csv",
+                                mime="text/csv",
+                                key=f"dl_low_profit_{bid or 'na'}",
+                            )
+                    else:
+                        st.success("🩸 做白工/虧損清單：本批次未發現利潤 < 0 的商品。")
+
+                    if not high_fee_df.empty:
+                        st.error("🧛 高抽成刺客清單：請檢查是否誤開免運或促銷活動。")
+                        high_fee_show = (
+                            high_fee_df[["商品原始名稱", "手續費率"]]
+                            .assign(手續費率=lambda d: (d["手續費率"] * 100.0).round(2).map(lambda v: f"{v:.2f}%"))
+                        )
+                        with st.expander(f"🧛 查看高抽成刺客清單（{len(high_fee_show)} 筆）", expanded=False):
+                            st.dataframe(
+                                high_fee_show,
+                                hide_index=True,
+                                width="stretch",
+                                height=170,
+                            )
+                            st.download_button(
+                                label="下載高抽成刺客清單 (CSV)",
+                                data=high_fee_show.to_csv(index=False).encode("utf-8-sig"),
+                                file_name="audit_high_fee_list.csv",
+                                mime="text/csv",
+                                key=f"dl_high_fee_{bid or 'na'}",
+                            )
+                    else:
+                        st.success("🧛 高抽成刺客清單：本批次未發現手續費率 > 13% 的商品。")
+
+                    st.info("👑 利潤守護者：主力推廣商品（單筆利潤絕對值最高前 2 名）。")
+                    guardians_show = (
+                        guardians_df[["商品原始名稱", "淨利潤"]]
+                        .rename(columns={"淨利潤": "利潤 (TWD)"})
+                        .assign(**{"利潤 (TWD)": lambda d: d["利潤 (TWD)"].round(0).astype(int)})
+                    )
+                    with st.expander(f"👑 查看利潤守護者（{len(guardians_show)} 筆）", expanded=False):
+                        st.dataframe(
+                            guardians_show,
+                            hide_index=True,
+                            width="stretch",
+                            height=150,
+                        )
+                        st.download_button(
+                            label="下載利潤守護者清單 (CSV)",
+                            data=guardians_show.to_csv(index=False).encode("utf-8-sig"),
+                            file_name="audit_profit_guardians.csv",
+                            mime="text/csv",
+                            key=f"dl_guardians_{bid or 'na'}",
+                        )
+            # 查帳明細表：唯一來源 FINAL_REPORT_SNAPSHOT。
+            audit_df = rows_df.copy() if isinstance(rows_df, pd.DataFrame) else pd.DataFrame()
+            if not audit_df.empty:
+                st.markdown("##### 📋 批次查帳明細表 (含總計回饋)")
+                audit_view = audit_df[
+                    [c for c in ["商品原始名稱", "實售收入", "成本", "成本來源", "手續費", "淨利潤"] if c in audit_df.columns]
+                ].copy()
+                for c in ["實售收入", "成本", "手續費", "淨利潤"]:
+                    audit_view[c] = pd.to_numeric(audit_view[c], errors="coerce").fillna(0.0)
+                totals = {
+                    "實售收入": int(round(float(audit_view["實售收入"].sum()))),
+                    "成本": int(round(float(audit_view["成本"].sum()))),
+                    "手續費": int(round(float(audit_view["手續費"].sum()))),
+                    "淨利潤": int(round(float(audit_view["淨利潤"].sum()))),
+                }
+                for c in ["實售收入", "成本", "手續費", "淨利潤"]:
+                    audit_view[c] = audit_view[c].round(0).astype(int)
+                with st.expander(f"📋 批次查帳明細表 (含總計回饋，共 {len(audit_view)} 筆明細)", expanded=True):
+                    st.dataframe(audit_view, hide_index=True, width="stretch", height=260)
+                    st.markdown(
+                        f"**總計回饋｜實售收入：{totals['實售收入']:,}｜成本：{totals['成本']:,}｜手續費：{totals['手續費']:,}｜淨利潤：{totals['淨利潤']:,}**"
+                    )
+                    st.download_button(
+                        label="下載查帳明細表 (CSV)",
+                        data=audit_view.to_csv(index=False).encode("utf-8-sig"),
+                        file_name="audit_detail_with_total.csv",
+                        mime="text/csv",
+                        key=f"dl_audit_detail_{bid or 'na'}",
+                    )
         summary_df = _build_batch_summary_df(
             result, history_actions, active_batch_id, history_detail_map
         )
@@ -2807,8 +4263,10 @@ def main():
                 "active_upload_time",
                 # 目前上傳檔
                 "uploaded_file",
+                "uploaded_file_cached_bytes",
+                "uploaded_file_cached_name",
                 # 逐筆審核/彙總 UI 的 widget 狀態
-                "show_only_pending",
+                "show_all_rows",
                 "reset_done_flags",
                 "history_batch_pick",
                 "download_batch_summary_csv",
@@ -2825,6 +4283,8 @@ def main():
                 "staged_draft_loaded_scope",
                 "review_meta_scope",
                 "review_meta_cache",
+                "sync_success_payload",
+                "FINAL_REPORT_SNAPSHOT",
             }
 
             for k in list(st.session_state.keys()):
@@ -2838,26 +4298,31 @@ def main():
 
             st.rerun()
 
-    if st.button("重新整理本頁完成狀態（不影響雲端資料）", key="reset_done_flags"):
-        for pos, idx in enumerate(result.index):
-            st.session_state.pop(f"done_r_{pos}_{idx}", None)
-        st.rerun()
+    has_staged_pending = len(_dedupe_staged_actions_by_uid(_staged_actions())) > 0
+    show_pre_sync_preview = has_staged_pending and (not all_done)
+    if show_pre_sync_preview:
+        st.caption("📝 以下資料為本地端即時解析與估算結果，尚未寫入雲端。")
+        with st.expander("🛠️ 進階與除錯狀態", expanded=False):
+            if st.button("重新整理本頁完成狀態（不影響雲端資料）", key="reset_done_flags"):
+                for pos, idx in enumerate(result.index):
+                    st.session_state.pop(f"done_r_{pos}_{idx}", None)
+                st.rerun()
 
-    with st.expander("📋 檢視完整處理結果表格", expanded=False):
-        st.dataframe(result, width="stretch", height=420)
+        with st.expander("📋 檢視完整處理結果表格 (同步前預覽)", expanded=False):
+            st.dataframe(result, width="stretch", height=420)
 
-    csv_out = result.to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        label="下載處理結果（CSV，Excel 可直接開啟）",
-        data=csv_out,
-        file_name="shopee_orders_processed.csv",
-        mime="text/csv",
-    )
+        csv_out = result.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            label="下載本地預覽結果 (CSV)",
+            data=csv_out,
+            file_name="shopee_orders_processed.csv",
+            mime="text/csv",
+        )
 
-    recon_df = build_accounting_reconciliation_df(df, result, order_total_fees)
-    with st.expander("📊 查看會計對帳明細", expanded=False):
-        st.caption("逐訂單：原始總金額 vs 展開後金額、訂單總手續費 vs 整數分攤加總。")
-        st.dataframe(recon_df, width="stretch", height=360)
+        recon_df = build_accounting_reconciliation_df(df, result, order_total_fees)
+        with st.expander("📊 查看會計對帳明細 (同步前預覽)", expanded=False):
+            st.caption("逐訂單：原始總金額 vs 展開後金額、訂單總手續費 vs 整數分攤加總。")
+            st.dataframe(recon_df, width="stretch", height=360)
 
 
 if __name__ == "__main__":
