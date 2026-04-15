@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import time
 from datetime import datetime
 from datetime import timedelta
 
@@ -85,6 +86,7 @@ REQUIRED_COLUMNS = [
 
 LOCAL_DRAFT_DIRNAME = ".cache"
 LOCAL_STAGED_DRAFT_FILENAME = "staged_actions_draft.json"
+LOCAL_FINAL_REPORT_CACHE_FILENAME = "last_batch_cache.json"
 DEFAULT_REPORT_SNAPSHOT_WORKSHEET = "Batch_Sync_Logs"
 
 REPORT_SNAPSHOT_HEADERS = [
@@ -1294,24 +1296,47 @@ def _build_final_report_snapshot(
 ) -> dict[str, object]:
     """
     Golden Record：同步當下即固定本批次完整對帳資料。
-    規則：成本必須可由雲端目標列回讀，否則直接報錯中止。
+    規則：成本優先取單筆已確認快照，其次回讀雲端，最後才用預估利潤率估算。
     """
     if cloud_df is None or cloud_df.empty:
         raise ValueError("無法建立戰報快照：雲端目錄未載入。")
+    try:
+        target_profit_pct = float(st.session_state.get("amount_tolerance_pct", 25.0) or 25.0) / 100.0
+    except Exception:
+        target_profit_pct = 0.25
+    target_profit_pct = max(0.0, min(1.0, target_profit_pct))
     rows: list[dict[str, object]] = []
+    errs: list[str] = []
     for a in write_actions:
         try:
             tr = int(a.get("target_row", 0) or 0)
         except Exception:
             tr = 0
         if tr <= 0:
-            raise ValueError("無法建立戰報快照：寫入目標列無效。")
+            errs.append(f"UID={str(a.get('order_uid', '') or '').strip() or 'unknown'}：target_row 無效")
+            continue
         r_cloud = get_catalog_row_by_sheet_row(cloud_df, tr)
-        cost = _extract_cost_from_cloud_row(r_cloud)
-        if cost is None or cost <= 0:
-            raise ValueError(f"無法建立戰報快照：第 {tr} 列讀不到有效單件成本。")
         sale = float(a.get("sale_price", 0) or 0)
         fee = float(a.get("fee_value", 0) or 0)
+        local_cost = float(a.get("selected_cost_snapshot", 0) or 0)
+        if local_cost <= 0:
+            local_cost = float(a.get("unit_cost", 0) or 0)
+        cloud_cost = _extract_cost_from_cloud_row(r_cloud)
+        cloud_cost_num = float(cloud_cost or 0)
+        if local_cost > 0:
+            cost = local_cost
+            cost_src = "✅ 本地快照"
+        elif cloud_cost_num > 0:
+            cost = cloud_cost_num
+            cost_src = "✅ 雲端回讀"
+        else:
+            est_cost = float(sale - fee - (sale * target_profit_pct))
+            if est_cost > 0:
+                cost = est_cost
+                cost_src = "⚠️ 系統估算"
+            else:
+                errs.append(f"ROW {tr}：成本缺失且估算失敗")
+                continue
         profit = sale - fee - float(cost)
         fee_rate = (fee / sale) if sale > 0 else 0.0
         rows.append(
@@ -1319,13 +1344,17 @@ def _build_final_report_snapshot(
                 "商品原始名稱": str(a.get("raw_name", "") or "").strip() or f"ROW:{tr}",
                 "實售收入": sale,
                 "成本": float(cost),
-                "成本來源": "✅ 雲端回讀",
+                "成本來源": cost_src,
                 "手續費": fee,
                 "淨利潤": profit,
                 "手續費率": fee_rate,
                 "目標列": tr,
             }
         )
+    if errs:
+        raise ValueError("同步前預檢未通過：\n- " + "\n- ".join(errs[:8]))
+    if not rows and write_actions:
+        raise ValueError("同步前預檢未通過：沒有可用的寫入明細。")
     df = pd.DataFrame(rows)
     total_rev = int(round(float(df["實售收入"].sum())))
     total_fee = int(round(float(df["手續費"].sum())))
@@ -1574,6 +1603,59 @@ def _save_local_staged_draft(scope: str, actions: list[dict]) -> None:
 
 def _clear_local_staged_draft(scope: str) -> None:
     _save_local_staged_draft(scope, [])
+
+
+def _local_final_report_cache_path() -> str:
+    draft_dir = os.path.join(os.path.dirname(__file__), LOCAL_DRAFT_DIRNAME)
+    os.makedirs(draft_dir, exist_ok=True)
+    return os.path.join(draft_dir, LOCAL_FINAL_REPORT_CACHE_FILENAME)
+
+
+def _save_local_final_report_cache(snapshot: dict[str, object]) -> None:
+    if not isinstance(snapshot, dict):
+        return
+    p = _local_final_report_cache_path()
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(snapshot, f, ensure_ascii=False, indent=2)
+
+
+def _load_local_final_report_cache() -> dict[str, object] | None:
+    p = _local_final_report_cache_path()
+    if not os.path.isfile(p):
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        return None
+    return None
+
+
+def _clear_local_final_report_cache() -> None:
+    p = _local_final_report_cache_path()
+    try:
+        if os.path.isfile(p):
+            os.remove(p)
+    except Exception:
+        pass
+
+
+def _retry_call(fn, *args, retries: int = 3, delay_sec: float = 0.7, **kwargs):
+    last_err: Exception | None = None
+    attempts = max(1, int(retries))
+    for i in range(attempts):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+            if i >= attempts - 1:
+                break
+            time.sleep(delay_sec)
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("retry_call failed without exception")
 
 
 def _staged_map_by_uid(actions: list[dict]) -> dict[str, dict]:
@@ -2638,11 +2720,23 @@ div[data-testid="stCheckbox"]:hover label span[style] {
             elif not can_history or not active_batch_id:
                 st.error("目前無法連線歷史紀錄，暫時不能同步。")
             else:
+                final_snapshot: dict[str, object] | None = None
                 try:
+                    writes = [
+                        a for a in staged_actions if str(a.get("action_type", "")).lower() == "write"
+                    ]
+                    # 同步前預檢：先驗證 target_row / 成本來源，未通過不得進入 API 呼叫。
+                    if writes:
+                        final_snapshot = _build_final_report_snapshot(
+                            writes,
+                            cloud_df=cloud_df,
+                            batch_id=str(active_batch_id or ""),
+                            csv_fp=str(csv_fp or ""),
+                            csv_name=str(csv_name or ""),
+                        )
+                        st.session_state["FINAL_REPORT_SNAPSHOT"] = final_snapshot
+                        _save_local_final_report_cache(final_snapshot)
                     with st.spinner("同步中，請稍候..."):
-                        writes = [
-                            a for a in staged_actions if str(a.get("action_type", "")).lower() == "write"
-                        ]
                         write_ops = [
                             {
                                 "sheet_row": int(a.get("target_row", 0) or 0),
@@ -2653,26 +2747,32 @@ div[data-testid="stCheckbox"]:hover label span[style] {
                             }
                             for a in writes
                         ]
-                        batch_write_order_values_to_sheet_rows(
+                        _retry_call(
+                            batch_write_order_values_to_sheet_rows,
                             cred_path,
                             spreadsheet_id,
                             worksheet_name.strip(),
                             write_ops,
+                            retries=3,
                         )
-                        append_history_actions_batch(
+                        _retry_call(
+                            append_history_actions_batch,
                             cred_path,
                             spreadsheet_id,
                             staged_actions + legacy_archive_actions,
+                            retries=3,
                         )
                         if writes:
-                            final_snapshot = _build_final_report_snapshot(
-                                writes,
-                                cloud_df=cloud_df,
-                                batch_id=str(active_batch_id or ""),
-                                csv_fp=str(csv_fp or ""),
-                                csv_name=str(csv_name or ""),
-                            )
+                            if final_snapshot is None:
+                                final_snapshot = _build_final_report_snapshot(
+                                    writes,
+                                    cloud_df=cloud_df,
+                                    batch_id=str(active_batch_id or ""),
+                                    csv_fp=str(csv_fp or ""),
+                                    csv_name=str(csv_name or ""),
+                                )
                             st.session_state["FINAL_REPORT_SNAPSHOT"] = final_snapshot
+                            _save_local_final_report_cache(final_snapshot)
                             snapshot_row = [
                                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                 datetime.now().strftime("%Y-%m"),
@@ -2683,11 +2783,13 @@ div[data-testid="stCheckbox"]:hover label span[style] {
                                 int(final_snapshot["total_profit"]),
                                 round(float(final_snapshot["avg_fee_rate"]), 6),
                             ]
-                            _append_report_snapshot_row(
+                            _retry_call(
+                                _append_report_snapshot_row,
                                 cred_path,
                                 spreadsheet_id,
                                 DEFAULT_REPORT_SNAPSHOT_WORKSHEET,
                                 snapshot_row,
+                                retries=3,
                             )
                         else:
                             st.session_state["FINAL_REPORT_SNAPSHOT"] = None
@@ -2703,13 +2805,17 @@ div[data-testid="stCheckbox"]:hover label span[style] {
                         for a in writes
                     ]
                     if dict_entries:
-                        batch_learn_dictionary_entries(
+                        _retry_call(
+                            batch_learn_dictionary_entries,
                             cred_path,
                             spreadsheet_id,
                             dict_entries,
+                            retries=3,
                         )
-                    gc_keep_latest_batches(
+                    _retry_call(
+                        gc_keep_latest_batches,
                         cred_path, spreadsheet_id, keep=history_keep_batches
+                        ,retries=3
                     )
                     _set_staged_actions([])
                     _clear_local_staged_draft(str(st.session_state.get("staged_draft_scope", "") or ""))
@@ -2738,6 +2844,10 @@ div[data-testid="stCheckbox"]:hover label span[style] {
                         st.caption("ℹ️ 本次同步皆為略過，未產生新的批次摘要。")
                     st.rerun()
                 except Exception as e:
+                    # 若同步末段失敗，保留快照供人工補跑/對帳。
+                    if isinstance(final_snapshot, dict):
+                        st.session_state["FINAL_REPORT_SNAPSHOT"] = final_snapshot
+                        _save_local_final_report_cache(final_snapshot)
                     _show_user_error("同步失敗，請稍後再試。", e)
         confirm_discard = st.checkbox(
             "我確認要清空本次暫存",
@@ -3862,6 +3972,16 @@ div[data-testid="stCheckbox"]:hover label span[style] {
                     unit_cost_num = _money_to_float(row.get("單件成本", ""))
                     if unit_cost_num is None:
                         unit_cost_num = _money_to_float(row.get("原始成本", ""))
+                    # 單筆決策當下即固定成本快照：優先使用畫面原始列，若缺值則回讀目標雲端列。
+                    selected_cost_source = "local_row"
+                    if unit_cost_num is None or float(unit_cost_num or 0) <= 0:
+                        cloud_cost_now = _extract_cost_from_cloud_row(r_target)
+                        if cloud_cost_now is not None and float(cloud_cost_now) > 0:
+                            unit_cost_num = float(cloud_cost_now)
+                            selected_cost_source = "cloud_target_row"
+                        else:
+                            unit_cost_num = 0.0
+                            selected_cost_source = "missing"
                     new_action = {
                         "batch_id": active_batch_id,
                         "upload_time": active_upload_time,
@@ -3877,8 +3997,10 @@ div[data-testid="stCheckbox"]:hover label span[style] {
                         "sale_price": float(row.get("商品原價", 0) or 0),
                         "fee_value": int(row.get("單件實扣手續費", 0) or 0),
                         "est_profit_twd": est_profit_num,
-                        "unit_cost": unit_cost_num,
+                        "unit_cost": float(unit_cost_num or 0.0),
                         "original_cost": row.get("單件成本", row.get("原始成本", "")),
+                        "selected_cost_source": selected_cost_source,
+                        "selected_cost_snapshot": float(unit_cost_num or 0.0),
                         "std_keyword": std_kw,
                         "prev_dict_keyword": prev_dict_kw,
                         "before_local": before_vals,
@@ -3961,6 +4083,11 @@ div[data-testid="stCheckbox"]:hover label span[style] {
         mc2.metric("成功寫入", n_write)
         mc3.metric("略過", n_skip)
         final_snapshot = st.session_state.get("FINAL_REPORT_SNAPSHOT")
+        if not isinstance(final_snapshot, dict):
+            cached_snapshot = _load_local_final_report_cache()
+            if isinstance(cached_snapshot, dict):
+                st.session_state["FINAL_REPORT_SNAPSHOT"] = cached_snapshot
+                final_snapshot = cached_snapshot
         if (
             isinstance(final_snapshot, dict)
             and int(final_snapshot.get("writes_count", 0) or 0) > 0
@@ -4227,6 +4354,7 @@ div[data-testid="stCheckbox"]:hover label span[style] {
 
         if st.button("🔄 處理下一份報表 (清除目前畫面)", type="primary"):
             _clear_local_staged_draft(str(st.session_state.get("staged_draft_scope", "") or ""))
+            _clear_local_final_report_cache()
             # Graceful Reset：只清「本批次」相關的 UI/進度狀態，保留雲端目錄與商品字典快取
             keep_keys = {
                 "cloud_catalog_df",
