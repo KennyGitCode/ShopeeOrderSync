@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date, datetime, timedelta
 from collections import Counter, defaultdict
 from typing import Any
 
@@ -120,6 +121,7 @@ def batch_write_order_values_to_sheet_rows(
     - buyer_account: str
     - sale_price: float|int
     - fee_value: float|int
+    - order_completed_date: str (選填，若 header map 有「訂單完成日期」則回填)
     """
     if not operations:
         return 0
@@ -145,6 +147,10 @@ def batch_write_order_values_to_sheet_rows(
                 Cell(row, int(hm["賣場手續費"]), str(op.get("fee_value", ""))),
             ]
         )
+        completed_date = str(op.get("order_completed_date", "") or "").strip()
+        completed_col = hm.get("訂單完成日期") or op.get("completed_date_col_index")
+        if completed_col and completed_date:
+            cells.append(Cell(row, int(completed_col), completed_date))
         n += 1
     if cells:
         ws.update_cells(cells, value_input_option="USER_ENTERED")
@@ -245,9 +251,7 @@ def fetch_worksheet_catalog(
         cells = cells[:ncols]
         rec = dict(zip(header, cells))
         # 供階段三更新用：保留欄位名稱對應到 1-based 欄索引（A=1, B=2...）
-        rec["_header_index_1based"] = {
-            k: (v + 1) for k, v in header_index.items() if k in REQUIRED_SHEET_COLUMNS
-        }
+        rec["_header_index_1based"] = {k: (v + 1) for k, v in header_index.items()}
         rec["_sheet_row"] = sheet_row
         pn = str(rec.get("品名", "") or "").strip()
         xi = str(rec.get("款式細項", "") or "").strip()
@@ -257,6 +261,83 @@ def fetch_worksheet_catalog(
         rows.append(rec)
 
     return pd.DataFrame(rows)
+
+
+def locate_header_column_index(
+    service_account_path: str,
+    spreadsheet_id: str,
+    worksheet_name: str,
+    header_text: str,
+) -> int | None:
+    """
+    讀取 Row2~3，回傳目標標題欄位索引（1-based）；找不到回傳 None。
+    """
+    gc = open_gspread_client(service_account_path)
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = sh.worksheet(worksheet_name)
+    rows = ws.get("A2:ZZ3", value_render_option="UNFORMATTED_VALUE")
+    target = str(header_text or "").strip()
+    if not target:
+        return None
+    for row in rows:
+        cells = [str(x or "").strip() for x in row]
+        for i, v in enumerate(cells, start=1):
+            if v == target:
+                return i
+    return None
+
+
+def _parse_sheet_date_value(raw: Any) -> date | None:
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    # Google Sheets 日期序號（UNFORMATTED_VALUE）
+    if isinstance(raw, (int, float)):
+        try:
+            return (datetime(1899, 12, 30) + timedelta(days=float(raw))).date()
+        except Exception:
+            return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    s = s.replace("/", "-").replace("T", " ")
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d %p %I:%M:%S", "%Y-%m-%d %p %I:%M"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            pass
+    try:
+        return datetime.fromisoformat(s).date()
+    except Exception:
+        return None
+
+
+def read_max_date_by_column_index(
+    service_account_path: str,
+    spreadsheet_id: str,
+    worksheet_name: str,
+    column_index_1based: int,
+) -> date | None:
+    """讀取指定欄（資料列從第4列開始）並回傳最大日期。"""
+    if int(column_index_1based or 0) <= 0:
+        return None
+    gc = open_gspread_client(service_account_path)
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = sh.worksheet(worksheet_name)
+    col_vals = ws.col_values(int(column_index_1based), value_render_option="UNFORMATTED_VALUE")
+    if len(col_vals) < SHEET_FIRST_DATA_ROW_1BASED:
+        return None
+    best: date | None = None
+    for raw in col_vals[SHEET_FIRST_DATA_ROW_1BASED - 1 :]:
+        d = _parse_sheet_date_value(raw)
+        if d is None:
+            continue
+        if best is None or d > best:
+            best = d
+    return best
 
 
 def platform_passes_filter(platform_cell: Any, stock_tag: str) -> bool:

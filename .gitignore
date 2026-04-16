@@ -8,3 +8,5 @@ appsetting.json
 .vscode/
 sync_history.json
 last_processed.json
+# 確保對帳暫存檔會被追蹤，以便跨電腦同步進度
+!.cache/staged_actions_draft.json

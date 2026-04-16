@@ -131,6 +131,63 @@ def load_history_keep_batches() -> int:
     return max(5, keep)
 
 
+def load_profit_compare_settings() -> dict[str, float]:
+    """讀取利潤比對設定（永久保存於 appsetting.json）。"""
+    data, _ = _read_appsetting_json()
+    sec = data.get("profitCompare")
+    if not isinstance(sec, dict):
+        sec = data.get("profit_compare")
+    if not isinstance(sec, dict):
+        return {
+            "fx_cny_to_twd": 5.0,
+            "card_extra_pct": 25.0,
+            "amount_tolerance_pct": 25.0,
+        }
+
+    def _f(name1: str, name2: str, default: float) -> float:
+        raw = sec.get(name1, sec.get(name2, default))
+        try:
+            return float(raw)
+        except Exception:
+            return float(default)
+
+    fx = _f("fxCnyToTwd", "fx_cny_to_twd", 5.0)
+    card = _f("cardExtraPct", "card_extra_pct", 25.0)
+    amount = _f("amountTolerancePct", "amount_tolerance_pct", 25.0)
+    return {
+        "fx_cny_to_twd": max(0.1, min(20.0, fx)),
+        "card_extra_pct": max(0.0, min(100.0, card)),
+        "amount_tolerance_pct": max(1.0, min(100.0, amount)),
+    }
+
+
+def save_profit_compare_settings(
+    fx_cny_to_twd: float,
+    card_extra_pct: float,
+    amount_tolerance_pct: float,
+) -> str | None:
+    """將利潤比對設定回寫至 appsetting.json。"""
+    cfg_path = PROJECT_ROOT / APPSETTING_FILENAME
+    data, err = _read_appsetting_json()
+    if err is not None:
+        return err
+    sec = data.get("profitCompare")
+    if not isinstance(sec, dict):
+        sec = {}
+        data["profitCompare"] = sec
+    sec["fxCnyToTwd"] = float(fx_cny_to_twd)
+    sec["cardExtraPct"] = float(card_extra_pct)
+    sec["amountTolerancePct"] = float(amount_tolerance_pct)
+    try:
+        cfg_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except Exception as e:
+        return f"寫入 {APPSETTING_FILENAME} 失敗：{e}"
+    return None
+
+
 def load_google_sheet_config(profile_name: str | None = None) -> tuple[str, str, str, str | None]:
     """
     回傳：(spreadsheet_url, worksheet_name, service_account_json_abs_path, error_message)

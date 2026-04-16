@@ -5,6 +5,11 @@
   "history": {
     "keepBatches": 100
   },
+  "profitCompare": {
+    "fxCnyToTwd": 5.0,
+    "cardExtraPct": 25.0,
+    "amountTolerancePct": 25.0
+  },
   "googleSheets": {
     "activeProfile": "prod",
     "profiles": {

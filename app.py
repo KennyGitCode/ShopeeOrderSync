@@ -15,6 +15,7 @@ import math
 import os
 import re
 import time
+from datetime import date
 from datetime import datetime
 from datetime import timedelta
 
@@ -31,8 +32,10 @@ from app_settings import (
     load_history_keep_batches,
     load_google_sheet_config,
     load_google_sheet_profiles,
+    load_profit_compare_settings,
     load_report_password_default,
     save_active_google_sheet_profile,
+    save_profit_compare_settings,
 )
 from sku_dictionary import (
     batch_learn_dictionary_entries,
@@ -47,13 +50,10 @@ from cloud_history import (
     gc_keep_latest_batches,
     group_batches,
     latest_uid_action_map,
-    latest_written_order_created_date,
     processed_uids_from_actions,
     read_history_actions,
-    read_setting_value,
     rollback_batch,
     rollback_order_uid,
-    write_setting_value,
 )
 from sheets_match import (
     SHEET_FIRST_DATA_ROW_1BASED,
@@ -62,11 +62,18 @@ from sheets_match import (
     fetch_worksheet_catalog,
     fuzzy_top3_matches,
     get_catalog_row_by_sheet_row,
+    locate_header_column_index,
+    read_max_date_by_column_index,
     row_has_order_like_data,
     batch_write_order_values_to_sheet_rows,
     open_gspread_client,
 )
 from text_normalize import normalize_for_match
+from battle_report import (
+    list_report_archive_json_paths,
+    render_battle_report,
+    save_to_archive,
+)
 
 # ---------------------------------------------------------------------------
 # 欄位與常數
@@ -86,7 +93,7 @@ REQUIRED_COLUMNS = [
 
 LOCAL_DRAFT_DIRNAME = ".cache"
 LOCAL_STAGED_DRAFT_FILENAME = "staged_actions_draft.json"
-LOCAL_FINAL_REPORT_CACHE_FILENAME = "last_batch_cache.json"
+LOCAL_REVIEW_RESUME_FILENAME = "review_resume_cache.json"
 DEFAULT_REPORT_SNAPSHOT_WORKSHEET = "Batch_Sync_Logs"
 
 REPORT_SNAPSHOT_HEADERS = [
@@ -408,42 +415,6 @@ def _amount_gap_hint_html(shopee_twd: int, est_twd: int, amount_gap_pct: float) 
         f"<div style='font-size:0.80rem;font-weight:800;color:#92400e;line-height:1.3;'>{html.escape(title)}</div>"
         f"<div style='font-size:0.75rem;color:#6b7280;line-height:1.4;margin-top:4px;'>{html.escape(detail)}</div>"
         "</div></div></div>"
-    )
-
-
-def _battle_metric_card_html(
-    title: str,
-    value_text: str,
-    unit_text: str = "",
-    *,
-    accent: str = "#0f172a",
-    badge_text: str = "",
-    badge_bg: str = "#dcfce7",
-    badge_fg: str = "#166534",
-) -> str:
-    """戰報頂部指標卡：取代 st.metric 避免標題截斷與留白失衡。"""
-    unit_html = (
-        f"<span style='font-size:0.78rem;color:#64748b;font-weight:700;margin-left:4px;'>{html.escape(unit_text)}</span>"
-        if unit_text
-        else ""
-    )
-    badge_html = (
-        "<div style='margin-top:10px;'>"
-        f"<span style='display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;"
-        f"background:{badge_bg};color:{badge_fg};font-size:0.74rem;font-weight:800;'>"
-        f"{html.escape(badge_text)}</span></div>"
-        if badge_text
-        else ""
-    )
-    return (
-        "<div style='height:100%;min-height:104px;border:1px solid #eceff3;border-radius:8px;"
-        "background:#fafafa;box-shadow:0 1px 3px rgba(15,23,42,0.06);padding:15px;"
-        "display:flex;flex-direction:column;justify-content:flex-start;box-sizing:border-box;'>"
-        f"<div style='font-size:14px;color:#666;font-weight:700;line-height:1.25;white-space:normal;'>{html.escape(title)}</div>"
-        f"<div style='margin-top:8px;display:flex;align-items:baseline;gap:2px;flex-wrap:wrap;'>"
-        f"<span style='font-size:2rem;line-height:1.1;font-weight:900;color:{accent};font-variant-numeric:tabular-nums;'>{html.escape(value_text)}</span>"
-        f"{unit_html}</div>"
-        f"{badge_html}</div>"
     )
 
 
@@ -1605,41 +1576,125 @@ def _clear_local_staged_draft(scope: str) -> None:
     _save_local_staged_draft(scope, [])
 
 
-def _local_final_report_cache_path() -> str:
+def _clear_all_local_staged_drafts() -> None:
+    """清空 .cache/staged_actions_draft.json 的所有 scope 暫存。"""
+    _write_all_local_staged_drafts({})
+
+
+def _local_review_resume_path() -> str:
     draft_dir = os.path.join(os.path.dirname(__file__), LOCAL_DRAFT_DIRNAME)
     os.makedirs(draft_dir, exist_ok=True)
-    return os.path.join(draft_dir, LOCAL_FINAL_REPORT_CACHE_FILENAME)
+    return os.path.join(draft_dir, LOCAL_REVIEW_RESUME_FILENAME)
 
 
-def _save_local_final_report_cache(snapshot: dict[str, object]) -> None:
-    if not isinstance(snapshot, dict):
-        return
-    p = _local_final_report_cache_path()
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(snapshot, f, ensure_ascii=False, indent=2)
-
-
-def _load_local_final_report_cache() -> dict[str, object] | None:
-    p = _local_final_report_cache_path()
+def _read_all_local_review_resumes() -> dict[str, dict]:
+    p = _local_review_resume_path()
     if not os.path.isfile(p):
-        return None
+        return {}
     try:
         with open(p, "r", encoding="utf-8") as f:
             obj = json.load(f)
-        if isinstance(obj, dict):
-            return obj
     except Exception:
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for k, v in obj.items():
+        key = str(k or "").strip()
+        if (not key) or (not isinstance(v, dict)):
+            continue
+        out[key] = dict(v)
+    return out
+
+
+def _write_all_local_review_resumes(data: dict[str, dict]) -> None:
+    p = _local_review_resume_path()
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _load_local_review_resume(scope: str) -> dict:
+    key = str(scope or "").strip()
+    if not key:
+        return {}
+    return dict(_read_all_local_review_resumes().get(key, {}))
+
+
+def _save_local_review_resume(scope: str, payload: dict) -> None:
+    key = str(scope or "").strip()
+    if not key:
+        return
+    rows = payload.get("result_rows", [])
+    if not isinstance(rows, list):
+        rows = []
+    data = _read_all_local_review_resumes()
+    data[key] = {
+        "updated_at": _now_text(),
+        "csv_name": str(payload.get("csv_name", "") or ""),
+        "csv_fp": str(payload.get("csv_fp", "") or ""),
+        "raw_file_total_count": int(payload.get("raw_file_total_count", 0) or 0),
+        "watermark_filtered_count": int(payload.get("watermark_filtered_count", 0) or 0),
+        "effective_new_order_count": int(payload.get("effective_new_order_count", 0) or 0),
+        "duplicate_filter_notice": str(payload.get("duplicate_filter_notice", "") or ""),
+        "date_gap_notice": str(payload.get("date_gap_notice", "") or ""),
+        "validation_issues": list(payload.get("validation_issues", []) or []),
+        "result_rows": [r for r in rows if isinstance(r, dict)],
+    }
+    _write_all_local_review_resumes(data)
+
+
+def _clear_local_review_resume(scope: str) -> None:
+    key = str(scope or "").strip()
+    if not key:
+        return
+    data = _read_all_local_review_resumes()
+    data.pop(key, None)
+    _write_all_local_review_resumes(data)
+
+
+def _clear_all_local_review_resumes() -> None:
+    _write_all_local_review_resumes({})
+
+
+def _parse_draft_scope(scope: str) -> tuple[str, str, str, str, str] | None:
+    txt = str(scope or "").strip()
+    parts = txt.rsplit("|", 4)
+    if len(parts) != 5:
         return None
-    return None
+    return parts[0], parts[1], parts[2], parts[3], parts[4]
 
 
-def _clear_local_final_report_cache() -> None:
-    p = _local_final_report_cache_path()
-    try:
-        if os.path.isfile(p):
-            os.remove(p)
-    except Exception:
-        pass
+def _pick_latest_resume_scope(
+    staged_drafts: dict[str, list[dict]],
+    resume_cache: dict[str, dict],
+    spreadsheet_id: str,
+    worksheet_name: str,
+    cred_path: str,
+) -> str:
+    target_sheet = str(spreadsheet_id or "").strip()
+    target_ws = str(worksheet_name or "").strip()
+    target_cred = str(cred_path or "").strip()
+    best_scope = ""
+    best_ts = ""
+    for scope, actions in staged_drafts.items():
+        if not isinstance(actions, list) or len(actions) <= 0:
+            continue
+        parsed = _parse_draft_scope(scope)
+        if parsed is None:
+            continue
+        _, _, scope_sheet, scope_ws, scope_cred = parsed
+        if (
+            str(scope_sheet).strip() != target_sheet
+            or str(scope_ws).strip() != target_ws
+            or str(scope_cred).strip() != target_cred
+        ):
+            continue
+        payload = resume_cache.get(scope, {})
+        ts = str(payload.get("updated_at", "") or "")
+        if (not best_scope) or (ts >= best_ts):
+            best_scope = scope
+            best_ts = ts
+    return best_scope
 
 
 def _retry_call(fn, *args, retries: int = 3, delay_sec: float = 0.7, **kwargs):
@@ -1982,13 +2037,9 @@ def _clear_review_runtime_state() -> None:
         "local_synced_action_map",
         "staged_draft_scope",
         "staged_draft_loaded_scope",
+        "preferred_resume_scope",
         "review_meta_scope",
         "review_meta_cache",
-        "system_cutoff_date",
-        "system_cutoff_date_picker",
-        "cutoff_loaded_scope",
-        "last_saved_cutoff_date",
-        "system_cutoff_dirty",
     }
     for k in list(st.session_state.keys()):
         if k in clear_exact or k.startswith(clear_prefixes):
@@ -2002,11 +2053,6 @@ def _profile_display_name(profile_name: str) -> str:
     if p in {"test", "testing"}:
         return "測試"
     return str(profile_name or "")
-
-
-def _mark_cutoff_dirty() -> None:
-    """僅在使用者手動調整接管日時，才標記需寫回雲端設定。"""
-    st.session_state["system_cutoff_dirty"] = True
 
 
 def _get_spreadsheet_title(service_account_path: str, spreadsheet_id: str) -> str:
@@ -2131,7 +2177,13 @@ div[data-testid="stCheckbox"]:hover label span[style] {
     st.title("📦 訂單入庫與雲端比對系統")
 
     with st.sidebar:
-        st.subheader("試算表連線")
+        app_main_menu = st.radio(
+            "主功能",
+            options=["order_flow", "report_history"],
+            format_func=lambda v: ("📦 訂單同步" if v == "order_flow" else "📜 歷史紀錄"),
+            key="app_main_menu",
+        )
+        st.divider()
         profile_cfg, active_profile, cfg_warn = load_google_sheet_profiles()
         profile_names = list(profile_cfg.keys())
         default_idx = profile_names.index(active_profile) if active_profile in profile_names else 0
@@ -2154,41 +2206,227 @@ div[data-testid="stCheckbox"]:hover label span[style] {
             cfg_warn = cfg_warn2
         sheet_id_for_caption = extract_spreadsheet_id(sheet_url) or ""
         sheet_title_for_caption = _get_spreadsheet_title(cred_path, sheet_id_for_caption)
-        st.caption("連線設定由系統設定檔讀取。")
-        st.caption(f"目前環境：**{_profile_display_name(selected_profile)}**")
-        if sheet_title_for_caption:
-            st.caption(f"試算表：**{sheet_title_for_caption}**")
-        elif sheet_id_for_caption:
-            st.caption(f"試算表代碼：`{sheet_id_for_caption}`")
-        st.caption(f"工作表：**{worksheet_name}**")
+        with st.expander("🔗 雲端資料庫狀態", expanded=False):
+            st.caption(f"目前環境：**{_profile_display_name(selected_profile)}**")
+            if sheet_title_for_caption:
+                st.caption(f"試算表：**{sheet_title_for_caption}**")
+            elif sheet_id_for_caption:
+                st.caption(f"試算表代碼：`{sheet_id_for_caption}`")
+            st.caption(f"工作表：**{worksheet_name}**")
         if cfg_warn:
             st.warning(cfg_warn)
 
+    if app_main_menu == "report_history":
+        st.subheader("📜 歷史戰報")
+        paths = list_report_archive_json_paths()
+        if not paths:
+            st.info(
+                "目前 `reports_archive/` 內尚無任何已存檔的戰報 JSON。"
+                "完成一次含「寫入」的同步後，會自動儲存至該資料夾。"
+            )
+            return
+        labels = [os.path.basename(p) for p in paths]
+        picked = st.multiselect(
+            "選擇歷史報表（可多選）",
+            options=list(range(len(paths))),
+            format_func=lambda i: labels[i],
+            key="history_archive_report_pick",
+            default=[0] if labels else [],
+        )
+        if not picked:
+            st.info("請至少選擇一份歷史報表。")
+            return
+        try:
+            loaded_reports: list[dict[str, object]] = []
+            merged_rows: list[dict[str, object]] = []
+            for idx in picked:
+                path = paths[int(idx)]
+                with open(path, "r", encoding="utf-8") as f:
+                    historic = json.load(f)
+                if not isinstance(historic, dict):
+                    st.warning(f"略過格式異常檔案：`{os.path.basename(path)}`")
+                    continue
+                historic = dict(historic)
+                if int(historic.get("writes_count", 0) or 0) <= 0:
+                    st.warning(f"略過無寫入筆數檔案：`{os.path.basename(path)}`")
+                    continue
+                historic["_archive_basename"] = os.path.splitext(os.path.basename(path))[0]
+                loaded_reports.append(historic)
+                rows = historic.get("audit_rows") or []
+                if isinstance(rows, list):
+                    merged_rows.extend([r for r in rows if isinstance(r, dict)])
+
+            if not loaded_reports:
+                st.error("選取的歷史檔案皆無法顯示戰報。")
+                return
+
+            # 單檔：維持原本呈現；多檔：合併明細後重算總額，交給同一 renderer。
+            if len(loaded_reports) == 1:
+                single = loaded_reports[0]
+                single["_widget_key_scope"] = str(single.get("_archive_basename", "history_single"))
+                render_battle_report(single)
+            else:
+                combined_df = pd.DataFrame(merged_rows)
+                if not combined_df.empty:
+                    for c in ["實售收入", "手續費", "成本", "淨利潤"]:
+                        if c in combined_df.columns:
+                            combined_df[c] = pd.to_numeric(combined_df[c], errors="coerce").fillna(0.0)
+                    total_revenue = int(round(float(combined_df["實售收入"].sum()))) if "實售收入" in combined_df.columns else 0
+                    total_fee = int(round(float(combined_df["手續費"].sum()))) if "手續費" in combined_df.columns else 0
+                    total_cost = int(round(float(combined_df["成本"].sum()))) if "成本" in combined_df.columns else 0
+                    total_profit = int(round(float(combined_df["淨利潤"].sum()))) if "淨利潤" in combined_df.columns else 0
+                else:
+                    total_revenue = sum(int(r.get("total_revenue", 0) or 0) for r in loaded_reports)
+                    total_fee = sum(int(r.get("total_fee", 0) or 0) for r in loaded_reports)
+                    total_cost = sum(int(r.get("total_cost", 0) or 0) for r in loaded_reports)
+                    total_profit = sum(int(r.get("total_profit", 0) or 0) for r in loaded_reports)
+                avg_fee_rate = (float(total_fee) / float(total_revenue)) if total_revenue > 0 else 0.0
+                combined_report_data = {
+                    "batch_id": f"combined_{len(loaded_reports)}",
+                    "csv_fp": "history_combined",
+                    "csv_name": f"合併報表_{len(loaded_reports)}批次",
+                    "writes_count": int(sum(int(r.get("writes_count", 0) or 0) for r in loaded_reports)),
+                    "total_revenue": int(total_revenue),
+                    "total_fee": int(total_fee),
+                    "total_cost": int(total_cost),
+                    "total_profit": int(total_profit),
+                    "avg_fee_rate": float(avg_fee_rate),
+                    "audit_rows": combined_df.to_dict(orient="records") if not combined_df.empty else [],
+                    "_widget_key_scope": f"history_combined_{len(loaded_reports)}_{len(merged_rows)}",
+                }
+                st.markdown(f"### 📊 合併報表 (共 {len(loaded_reports)} 批次)")
+                render_battle_report(combined_report_data)
+        except Exception as e:
+            _show_user_error("無法讀取歷史戰報。", e)
+        return
+
     spreadsheet_id = extract_spreadsheet_id(sheet_url)
-    watermark_last = None
+    hwm_col_idx: int | None = None
+    hwm_error: str | None = None
     if spreadsheet_id and os.path.isfile(cred_path):
         try:
-            wm_actions = read_history_actions(cred_path, spreadsheet_id)
-            watermark_last = latest_written_order_created_date(wm_actions)
-        except Exception:
-            watermark_last = None
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    if watermark_last:
-        last_dt = datetime.strptime(watermark_last, "%Y-%m-%d")
-        suggest_start = (last_dt - timedelta(days=40)).strftime("%Y-%m-%d")
-        watermark_line1 = f"雲端最新一筆紀錄停留在：**{watermark_last}**"
-    else:
-        suggest_start = (datetime.now() - timedelta(days=40)).strftime("%Y-%m-%d")
-        watermark_line1 = "雲端最新一筆紀錄停留在：**尚無已同步寫入紀錄**"
+            hwm_col_idx = locate_header_column_index(
+                cred_path,
+                spreadsheet_id,
+                worksheet_name.strip(),
+                "訂單完成日期",
+            )
+            if hwm_col_idx is None:
+                hwm_error = "❌ 找不到雲端欄位「訂單完成日期」（掃描 Rows 2:3 失敗），請檢查工作表標題。"
+        except Exception as e:
+            hwm_error = f"❌ 無法掃描雲端標題欄位：{e}"
+    elif spreadsheet_id:
+        hwm_error = "❌ 找不到服務帳戶憑證，無法讀取雲端標題水位線。"
+
+    hwm_default_date = date(2026, 1, 1)
+    hwm_date = hwm_default_date
+    if hwm_col_idx is not None:
+        try:
+            d0 = read_max_date_by_column_index(
+                cred_path,
+                spreadsheet_id,
+                worksheet_name.strip(),
+                hwm_col_idx,
+            )
+            if d0 is not None:
+                hwm_date = d0
+        except Exception as e:
+            hwm_error = f"❌ 無法讀取雲端最新進度日期：{e}"
+    suggest_start_dt = hwm_date + timedelta(days=1)
+    watermark_line1 = f"📊 雲端最新進度：**{hwm_date.strftime('%Y-%m-%d')}**"
+    suggest_line = f"💡 下次建議下載區間：自 **{suggest_start_dt.strftime('%Y-%m-%d')}** 起"
+    local_drafts_all = _read_all_local_staged_drafts()
+    local_resume_cache = _read_all_local_review_resumes()
+    local_staging_count = sum(len(v or []) for v in local_drafts_all.values())
+    preferred_resume_scope = str(st.session_state.get("preferred_resume_scope", "") or "").strip()
+    if preferred_resume_scope:
+        parsed_pref = _parse_draft_scope(preferred_resume_scope)
+        if parsed_pref is None:
+            preferred_resume_scope = ""
+        else:
+            _, _, pref_sheet, pref_ws, pref_cred = parsed_pref
+            if (
+                str(pref_sheet).strip() != str(spreadsheet_id or "").strip()
+                or str(pref_ws).strip() != str(worksheet_name.strip())
+                or str(pref_cred).strip() != str(cred_path or "").strip()
+            ):
+                preferred_resume_scope = ""
+    if not preferred_resume_scope:
+        preferred_resume_scope = _pick_latest_resume_scope(
+            local_drafts_all,
+            local_resume_cache,
+            spreadsheet_id,
+            worksheet_name.strip(),
+            cred_path,
+        )
+        if preferred_resume_scope:
+            st.session_state["preferred_resume_scope"] = preferred_resume_scope
+    resume_payload = (
+        _load_local_review_resume(preferred_resume_scope) if preferred_resume_scope else {}
+    )
+    has_resume_rows = bool(isinstance(resume_payload.get("result_rows"), list) and resume_payload.get("result_rows"))
+    if (not has_resume_rows) and preferred_resume_scope:
+        staged_only = list(local_drafts_all.get(preferred_resume_scope, []) or [])
+        fallback_rows: list[dict[str, object]] = []
+        for i, a in enumerate(staged_only):
+            if not isinstance(a, dict):
+                continue
+            fallback_rows.append(
+                {
+                    "uid": str(a.get("order_uid", "") or f"resume_{i}"),
+                    "訂單成立日期": str(a.get("order_created_at", "") or ""),
+                    "買家帳號": str(a.get("buyer_account", "") or ""),
+                    "商品原價": float(a.get("sale_price", 0) or 0),
+                    "單件實扣手續費": int(a.get("fee_value", 0) or 0),
+                    "合併原始名稱": str(a.get("raw_name", "") or ""),
+                    "清洗後簡體名稱": clean_name_for_simplified(str(a.get("raw_name", "") or "")),
+                    "現貨預定標記": str(a.get("stock_tag", "") or ""),
+                    "單件成本": float(a.get("selected_cost_snapshot", a.get("unit_cost", 0)) or 0),
+                    "原始成本": float(a.get("original_cost", 0) or 0),
+                }
+            )
+        if fallback_rows:
+            resume_payload = {
+                "csv_name": "resume_from_staged_actions",
+                "csv_fp": "resume_from_staged_actions",
+                "raw_file_total_count": len(fallback_rows),
+                "watermark_filtered_count": 0,
+                "effective_new_order_count": len(fallback_rows),
+                "duplicate_filter_notice": "",
+                "date_gap_notice": "",
+                "validation_issues": [],
+                "result_rows": fallback_rows,
+            }
+            has_resume_rows = True
+    resume_ready = bool(preferred_resume_scope and has_resume_rows)
     uploaded_exists = st.session_state.get("uploaded_file") is not None
-    collapsed_in_review = uploaded_exists
+    collapsed_in_review = uploaded_exists or resume_ready
+    csv_name = ""
+    csv_fp = ""
+    result = pd.DataFrame()
+    raw_file_total_count = 0
+    watermark_filtered_count = 0
+    duplicate_filter_notice = ""
+    date_gap_notice = ""
+    effective_new_order_count = 0
+    validation_issues: list[dict] = []
     with st.expander("對帳三步曲", expanded=not collapsed_in_review):
+        if hwm_error:
+            st.error(hwm_error)
+        if local_staging_count > 0:
+            st.warning(
+                f"⚠️ 偵測到本地尚有 {local_staging_count} 筆訂單正在核對中，"
+                "請優先完成同步或清除暫存。"
+            )
+        info_lines = [
+            "**📍 第一步：前往蝦皮匯出報表**",
+            f"* {watermark_line1}",
+        ]
+        if local_staging_count <= 0:
+            info_lines.append(f"* {suggest_line}")
+        info_lines.append("* 操作提示：請在蝦皮後台將訂單狀態選為「已完成」，匯出建議起點之後的報表。")
         st.info(
-            "**📍 第一步：前往蝦皮匯出報表**\n"
-            f"* {watermark_line1}\n"
-            f"* 💡 **請匯出區間：{suggest_start} 至 {yesterday}**\n"
-            "* 操作提示：請在蝦皮後台將訂單狀態選為「已完成」，匯出上述區間的報表。"
-            "(註：系統已自動往前推 40 天防漏單，重複資料會自動剔除，請安心整包匯出)"
+            "\n".join(info_lines)
         )
         st.markdown("**🔐 第二步：輸入報表解鎖密碼**")
         pw_default = load_report_password_default() or "請在此處填寫使用者的預設密碼"
@@ -2198,48 +2436,117 @@ div[data-testid="stCheckbox"]:hover label span[style] {
             value=pw_default,
             key="shopee_password",
         )
-        st.markdown("**📤 第三步：上傳報表檔案 (CSV / 加密 XLSX)**")
-        uploaded = st.file_uploader("上傳 CSV / XLSX", type=["csv", "xlsx"], key="uploaded_file")
-        if uploaded is None:
-            cached_bytes = st.session_state.get("uploaded_file_cached_bytes")
-            cached_name = str(st.session_state.get("uploaded_file_cached_name", "") or "")
-            if isinstance(cached_bytes, (bytes, bytearray)) and cached_name:
-                raw_bytes = bytes(cached_bytes)
-                csv_name = cached_name
-            else:
-                st.info("請完成第二步密碼確認後，於第三步上傳報表檔案。")
-                return
-        else:
-            # getvalue() 可重複讀取；避免只用 read() 後指標在結尾
-            raw_bytes = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
-            csv_name = getattr(uploaded, "name", "unknown.csv")
-            st.session_state["uploaded_file_cached_bytes"] = bytes(raw_bytes)
-            st.session_state["uploaded_file_cached_name"] = str(csv_name)
-        csv_fp = _fingerprint_bytes(raw_bytes)
-        try:
-            df = _read_uploaded_report_dataframe(
-                raw_bytes,
-                csv_name,
-                password=shopee_password,
+        if resume_ready:
+            resumed_csv_name, resumed_csv_fp, _, _, _ = _parse_draft_scope(preferred_resume_scope) or ("", "", "", "", "")
+            csv_name = str(resume_payload.get("csv_name", resumed_csv_name) or resumed_csv_name or "resume_restored")
+            csv_fp = str(resume_payload.get("csv_fp", resumed_csv_fp) or resumed_csv_fp or "resume_restored")
+            result_rows = resume_payload.get("result_rows", [])
+            result = pd.DataFrame(result_rows if isinstance(result_rows, list) else [])
+            raw_file_total_count = int(resume_payload.get("raw_file_total_count", len(result)) or len(result))
+            watermark_filtered_count = int(resume_payload.get("watermark_filtered_count", 0) or 0)
+            effective_new_order_count = int(resume_payload.get("effective_new_order_count", len(result)) or len(result))
+            duplicate_filter_notice = str(resume_payload.get("duplicate_filter_notice", "") or "")
+            date_gap_notice = str(resume_payload.get("date_gap_notice", "") or "")
+            raw_issues = resume_payload.get("validation_issues", [])
+            validation_issues = [x for x in raw_issues if isinstance(x, dict)]
+            st.info("📦 偵測到未完成的任務，正在從本地暫存載入中...")
+            st.caption(
+                f"已恢復：`{os.path.basename(csv_name)}`｜"
+                f"待審核資料 {len(result)} 筆。"
             )
-        except Exception:
-            st.error("密碼錯誤或檔案無法解密，請確認第二步的密碼設定")
+        else:
+            st.markdown("**📤 第三步：上傳報表檔案 (CSV / 加密 XLSX)**")
+            uploaded = st.file_uploader("上傳 CSV / XLSX", type=["csv", "xlsx"], key="uploaded_file")
+            if uploaded is None:
+                cached_bytes = st.session_state.get("uploaded_file_cached_bytes")
+                cached_name = str(st.session_state.get("uploaded_file_cached_name", "") or "")
+                if isinstance(cached_bytes, (bytes, bytearray)) and cached_name:
+                    raw_bytes = bytes(cached_bytes)
+                    csv_name = cached_name
+                else:
+                    st.info("請完成第二步密碼確認後，於第三步上傳報表檔案。")
+            else:
+                # getvalue() 可重複讀取；避免只用 read() 後指標在結尾
+                raw_bytes = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
+                csv_name = getattr(uploaded, "name", "unknown.csv")
+                st.session_state["uploaded_file_cached_bytes"] = bytes(raw_bytes)
+                st.session_state["uploaded_file_cached_name"] = str(csv_name)
+            if csv_name:
+                csv_fp = _fingerprint_bytes(raw_bytes)
+                try:
+                    df = _read_uploaded_report_dataframe(
+                        raw_bytes,
+                        csv_name,
+                        password=shopee_password,
+                    )
+                except Exception:
+                    st.error("密碼錯誤或檔案無法解密，請確認第二步的密碼設定")
+                    df = None
+
+                if isinstance(df, pd.DataFrame):
+                    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+                    if missing:
+                        st.error("CSV 欄位格式不符，缺少欄位：" + "、".join(f"`{m}`" for m in missing))
+                        st.dataframe(df.head(20), width="stretch")
+                    else:
+                        try:
+                            result, validation_issues, _ = process_dataframe(df)
+                        except Exception as e:
+                            _show_user_error("檔案讀取完成，但資料整理失敗。請先確認報表格式是否正確。", e)
+                            result = pd.DataFrame()
+                            validation_issues = []
+
+                        # Auto-Slice Loader：僅保留日期 > 水位線的訂單進入後續流程。
+                        raw_file_total_count = int(len(result))
+                        if isinstance(result, pd.DataFrame) and (not result.empty):
+                            _date_txt = result["訂單成立日期"].map(_to_date_text)
+                            _dt_series = pd.to_datetime(_date_txt, errors="coerce")
+                            _hwm_ts = pd.Timestamp(hwm_date)
+                            old_mask = _dt_series.notna() & (_dt_series <= _hwm_ts)
+                            old_cnt = int(old_mask.sum())
+                            if old_cnt > 0:
+                                watermark_filtered_count = old_cnt
+                                result = result.loc[~old_mask].copy().reset_index(drop=True)
+                                duplicate_filter_notice = f"🛡️ 已過濾 {old_cnt} 筆與雲端重複之訂單。"
+                            # 斷層警示：最小日期 > (MaxDate + 1天)
+                            valid_new_dates = _dt_series.loc[~old_mask & _dt_series.notna()]
+                            if not valid_new_dates.empty:
+                                min_new_dt = valid_new_dates.min().date()
+                                expected_next = hwm_date + timedelta(days=1)
+                                if min_new_dt > expected_next:
+                                    date_gap_notice = "⚠️ 偵測到日期不連續（可能漏抓報表）。"
+                        effective_new_order_count = int(len(result))
+                        current_display_scope = f"{csv_name}|{csv_fp}|{spreadsheet_id}|{worksheet_name.strip()}"
+                        current_draft_scope = f"{current_display_scope}|{cred_path}"
+                        _save_local_review_resume(
+                            current_draft_scope,
+                            {
+                                "csv_name": csv_name,
+                                "csv_fp": csv_fp,
+                                "raw_file_total_count": raw_file_total_count,
+                                "watermark_filtered_count": watermark_filtered_count,
+                                "effective_new_order_count": effective_new_order_count,
+                                "duplicate_filter_notice": duplicate_filter_notice,
+                                "date_gap_notice": date_gap_notice,
+                                "validation_issues": validation_issues,
+                                "result_rows": result.to_dict(orient="records"),
+                            },
+                        )
+                        st.session_state["preferred_resume_scope"] = current_draft_scope
+
+        if result.empty:
             return
 
-        missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-        if missing:
-            st.error("CSV 欄位格式不符，缺少欄位：" + "、".join(f"`{m}`" for m in missing))
-            st.dataframe(df.head(20), width="stretch")
-            return
-
-        try:
-            result, validation_issues, order_total_fees = process_dataframe(df)
-        except Exception as e:
-            _show_user_error("檔案讀取完成，但資料整理失敗。請先確認報表格式是否正確。", e)
-            return
+        reminder_items = [m for m in [duplicate_filter_notice, date_gap_notice] if m]
+        if reminder_items:
+            remind_body = "🔍 數據勾稽提醒：\n\n" + "\n".join([f"- {m}" for m in reminder_items])
+            if date_gap_notice:
+                st.warning(remind_body)
+            else:
+                st.info(remind_body)
 
         if not validation_issues:
-            st.success("✅ 所有訂單的金額與手續費加總驗證通過！帳務吻合。")
+            validation_status_line = "✅ 所有訂單的金額與手續費加總驗證通過！帳務吻合。"
         else:
             st.error("發現訂單驗證失敗，請先確認以下差異再進行後續帳務流程：")
             for issue in validation_issues:
@@ -2248,12 +2555,15 @@ div[data-testid="stCheckbox"]:hover label span[style] {
                     f"預期={issue['預期值']:.2f}，實際={issue['實際值']:.2f}，"
                     f"差額={issue['差額']:+.2f}"
                 )
+            validation_status_line = "❌ 金額與手續費驗證未通過，請先修正後再進行後續流程。"
 
-        st.success(f"處理完成，共 **{len(result)}** 列（展開後）。")
-        st.info(
-            "手續費已依單件金額比例分攤為 **單件實扣手續費**；"
-            "已不顯示原始「成交／其他／金流」手續費欄位，避免與分攤結果混淆。"
-        )
+        with st.expander("📊 帳務校驗細節", expanded=False):
+            st.caption(validation_status_line)
+            st.caption(f"處理完成，共 **{len(result)}** 列（展開後）。")
+            st.caption(
+                "手續費已依單件金額比例分攤為 **單件實扣手續費**；"
+                "已不顯示原始「成交／其他／金流」手續費欄位，避免與分攤結果混淆。"
+            )
 
     # --- 階段二：載入雲端目錄（可快取；設定來自 appsetting.json）---
 
@@ -2390,157 +2700,6 @@ div[data-testid="stCheckbox"]:hover label span[style] {
     effective_completed_uids = set(completed_uids) | set(local_synced_action_map.keys())
 
     all_parsed_orders = result.copy()
-    report_earliest_date = _earliest_order_date_in_report(all_parsed_orders)
-    default_cutoff_date = report_earliest_date or datetime.strptime(
-        suggest_start, "%Y-%m-%d"
-    ).date()
-    if "system_cutoff_date" not in st.session_state:
-        st.session_state["system_cutoff_date"] = default_cutoff_date
-    if "system_cutoff_dirty" not in st.session_state:
-        st.session_state["system_cutoff_dirty"] = False
-    # 跨電腦同步：從雲端設定表讀取接管日（僅首次載入該 scope）
-    cutoff_scope = f"{spreadsheet_id}|{worksheet_name.strip()}|{cred_path}"
-    if (
-        spreadsheet_id
-        and os.path.isfile(cred_path)
-        and st.session_state.get("cutoff_loaded_scope") != cutoff_scope
-    ):
-        # 進入新環境/新工作表時，先回到本次報表最早日期（或建議值），避免沿用舊 scope 的接管日。
-        st.session_state["system_cutoff_date"] = default_cutoff_date
-        st.session_state["system_cutoff_date_picker"] = default_cutoff_date
-        st.session_state["system_cutoff_dirty"] = False
-        try:
-            v = read_setting_value(
-                cred_path,
-                spreadsheet_id,
-                key="system_cutoff_date",
-            )
-            if v:
-                st.session_state["system_cutoff_date"] = datetime.strptime(v, "%Y-%m-%d").date()
-                st.session_state["last_saved_cutoff_date"] = str(v)
-        except Exception:
-            pass
-        st.session_state["cutoff_loaded_scope"] = cutoff_scope
-    if "last_saved_cutoff_date" not in st.session_state:
-        st.session_state["last_saved_cutoff_date"] = st.session_state["system_cutoff_date"].strftime("%Y-%m-%d")
-    if "system_cutoff_date_picker" not in st.session_state:
-        st.session_state["system_cutoff_date_picker"] = st.session_state["system_cutoff_date"]
-    if st.session_state.get("sync_cutoff_picker_pending", False):
-        st.session_state["system_cutoff_date_picker"] = st.session_state["system_cutoff_date"]
-        st.session_state["sync_cutoff_picker_pending"] = False
-    with st.expander("進階設定", expanded=not collapsed_in_review):
-        st.caption("不確定怎麼設定時，建議先維持預設值。")
-        st.date_input(
-            "📅 決定系統接管日 (此日期之前的訂單將被直接封存)",
-            key="system_cutoff_date_picker",
-            on_change=_mark_cutoff_dirty,
-        )
-        st.session_state["system_cutoff_date"] = st.session_state["system_cutoff_date_picker"]
-        # 僅當使用者手動變更時才寫回，避免 refresh 時把預設值覆蓋雲端設定。
-        if spreadsheet_id and os.path.isfile(cred_path):
-            cutoff_text = st.session_state["system_cutoff_date"].strftime("%Y-%m-%d")
-            if st.session_state.get("system_cutoff_dirty", False):
-                try:
-                    write_setting_value(
-                        cred_path,
-                        spreadsheet_id,
-                        key="system_cutoff_date",
-                        value=cutoff_text,
-                    )
-                    st.session_state["last_saved_cutoff_date"] = cutoff_text
-                    st.session_state["system_cutoff_dirty"] = False
-                except Exception:
-                    pass
-        st.markdown("#### 📊 接管日期分析（依本次上傳資料）")
-        if cloud_df is None or cloud_df.empty:
-            st.warning("尚未載入主試算表資料，暫時無法分析建議接管日。")
-        else:
-            legacy_pool = cloud_df[
-                cloud_df["平台"].fillna("").astype(str).str.contains("蝦皮")
-            ].copy()
-            legacy_pool["__buyer"] = legacy_pool["買家"].fillna("").astype(str).str.strip()
-            legacy_pool["__price"] = legacy_pool["賣場售價"].map(_money_to_int)
-
-            radar_df = all_parsed_orders.copy()
-            radar_df["__date"] = radar_df["訂單成立日期"].map(_to_date_text)
-            radar_df["__buyer"] = radar_df["買家帳號"].fillna("").astype(str).str.strip()
-            radar_df["__price"] = radar_df["商品原價"].map(_money_to_int)
-            radar_df = radar_df[radar_df["__date"] != ""].copy()
-
-            hit_flags: list[bool] = []
-            for _, r in radar_df.iterrows():
-                buyer = str(r.get("__buyer", "") or "")
-                price = r.get("__price")
-                if not buyer:
-                    hit_flags.append(False)
-                    continue
-                cands = legacy_pool[legacy_pool["__buyer"] == buyer]
-                hit_idx = None
-                if not cands.empty and price is not None:
-                    mm = cands[cands["__price"].notna()].copy()
-                    if not mm.empty:
-                        mm["__delta"] = (mm["__price"].astype(int) - int(price)).abs()
-                        mm = mm.sort_values(["__delta", "_sheet_row"], ascending=[True, True])
-                        best = mm.iloc[0]
-                        if int(best["__delta"]) <= 1:
-                            hit_idx = best.name
-                if hit_idx is None and not cands.empty and price is None:
-                    hit_idx = cands.iloc[0].name
-                if hit_idx is not None:
-                    legacy_pool = legacy_pool.drop(index=hit_idx)
-                    hit_flags.append(True)
-                else:
-                    hit_flags.append(False)
-
-            radar_df["__hit"] = hit_flags
-            daily = (
-                radar_df.groupby("__date", sort=True)
-                .agg(
-                    csv_total=("uid", "count"),
-                    hit_count=("__hit", "sum"),
-                )
-                .reset_index()
-                .rename(columns={"__date": "日期"})
-            )
-            daily["未匹配數"] = daily["csv_total"] - daily["hit_count"]
-            daily["命中率"] = ((daily["hit_count"] / daily["csv_total"]) * 100.0).round(1)
-            daily = daily.sort_values("日期", ascending=True).reset_index(drop=True)
-            daily["前日命中率"] = daily["命中率"].shift(1)
-            daily["跌幅"] = (daily["前日命中率"] - daily["命中率"]).fillna(0.0)
-            drop_mask = (daily["跌幅"] > 40.0) & (daily["命中率"] < 50.0)
-            suspected_cutoff_date = None
-            hit_drop = daily[drop_mask]
-            if not hit_drop.empty:
-                suspected_cutoff_date = str(hit_drop.iloc[0]["日期"])
-            daily["指標"] = daily["命中率"].map(
-                lambda v: "🟢 高" if v >= 80 else ("🔴 低" if v < 50 else "🟡 中")
-            )
-            if suspected_cutoff_date:
-                daily.loc[daily["日期"] == suspected_cutoff_date, "指標"] = (
-                    daily.loc[daily["日期"] == suspected_cutoff_date, "指標"] + " ⚠️ 疑似斷層"
-                )
-            show_df = daily.rename(
-                columns={
-                    "csv_total": "CSV 總單數",
-                    "hit_count": "匹配成功數",
-                }
-            )[["日期", "CSV 總單數", "匹配成功數", "未匹配數", "命中率", "指標"]]
-            if suspected_cutoff_date:
-                st.error(
-                    "⚠️ **偵測到可能的交接斷點**\n"
-                    f"在 **{suspected_cutoff_date}** 前後，歷史命中率明顯下降。\n"
-                    "建議將「系統接管日」設在這一天（或前後一天）再觀察。"
-                )
-                if st.button("✨ 一鍵套用建議日期", key="apply_suspected_cutoff_date"):
-                    picked_date = datetime.strptime(
-                        suspected_cutoff_date, "%Y-%m-%d"
-                    ).date()
-                    st.session_state["system_cutoff_date"] = picked_date
-                    st.session_state["sync_cutoff_picker_pending"] = True
-                    st.rerun()
-            st.dataframe(show_df, hide_index=True, width="stretch")
-
-    system_cutoff_date = st.session_state["system_cutoff_date"]
     st.session_state["legacy_archive_actions"] = []
     duplicate_idx: list[int] = []
     legacy_archive_idx: list[int] = []
@@ -2554,14 +2713,14 @@ div[data-testid="stCheckbox"]:hover label span[style] {
             continue
 
         dt_txt = _to_date_text(row.get("訂單成立日期"))
-        is_legacy_archive = False
+        is_old_or_duplicate = False
         if dt_txt:
             try:
                 row_dt = datetime.strptime(dt_txt, "%Y-%m-%d").date()
-                is_legacy_archive = row_dt < system_cutoff_date
+                is_old_or_duplicate = row_dt <= hwm_date
             except Exception:
-                is_legacy_archive = False
-        if is_legacy_archive:
+                is_old_or_duplicate = False
+        if is_old_or_duplicate:
             legacy_archive_idx.append(i)
             legacy_archive_actions.append(
                 {
@@ -2597,12 +2756,19 @@ div[data-testid="stCheckbox"]:hover label span[style] {
     with st.expander("📥 本次分流摘要（審核前總覽）", expanded=not collapsed_in_review):
         st.success("📥 報表讀取與智慧分流成功！")
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("總訂單數", len(all_parsed_orders))
-        m2.metric("🛡️ 已在歷史紀錄", len(duplicate_orders))
-        m3.metric("📦 接管日前封存", len(legacy_archive_orders))
-        m4.metric("🚀 本次待處理新單", len(pending_orders))
-        if len(duplicate_orders) > 0 or len(legacy_archive_orders) > 0:
-            st.caption("歷史已處理與接管日前封存資料皆不顯示於下方卡片。")
+        m1.metric("📄 檔案原始總數", int(raw_file_total_count))
+        water_label = "🟧 水位線已過濾" if int(watermark_filtered_count) > 0 else "🛡️ 水位線已過濾"
+        m2.metric(water_label, int(watermark_filtered_count))
+        m3.metric("🚀 本次待處理", len(pending_orders))
+        m4.metric("📄 有效新單", int(effective_new_order_count))
+        if int(watermark_filtered_count) > 0:
+            st.caption(
+                f"💡 註：有 {int(watermark_filtered_count)} 筆 "
+                f"{hwm_date.strftime('%m/%d')}（含）以前的訂單已存在於雲端紀錄，"
+                "系統已自動排除以防止重複。"
+            )
+        if len(duplicate_orders) > 0:
+            st.caption(f"另有 {len(duplicate_orders)} 筆已在歷史紀錄，已從待處理清單移除。")
         if st.checkbox("顯示歷史已處理（唯讀）", key="show_filtered_history", value=False):
             filtered_rows: list[dict[str, str]] = []
             for _, r in duplicate_orders.iterrows():
@@ -2626,7 +2792,7 @@ div[data-testid="stCheckbox"]:hover label span[style] {
             for _, r in legacy_archive_orders.iterrows():
                 filtered_rows.append(
                     {
-                        "狀態": "接管日前封存",
+                        "狀態": "水位線重複",
                         "訂單成立日期": str(r.get("訂單成立日期", "") or ""),
                         "買家": str(r.get("買家帳號", "") or ""),
                         "商品原價": str(r.get("商品原價", "") or ""),
@@ -2635,7 +2801,7 @@ div[data-testid="stCheckbox"]:hover label span[style] {
                 )
             if filtered_rows:
                 filtered_df = pd.DataFrame(filtered_rows)
-                status_order = ["已同步寫入", "已同步略過", "接管日前封存", "已在歷史紀錄"]
+                status_order = ["已同步寫入", "已同步略過", "水位線重複", "已在歷史紀錄"]
                 status_options = [s for s in status_order if s in set(filtered_df["狀態"].tolist())]
                 picked_statuses = st.multiselect(
                     "篩選狀態",
@@ -2653,12 +2819,17 @@ div[data-testid="stCheckbox"]:hover label span[style] {
     result = pending_orders
 
     with st.sidebar:
-        if "fx_cny_to_twd" not in st.session_state:
-            st.session_state["fx_cny_to_twd"] = 5.0
-        if "card_extra_pct" not in st.session_state:
-            st.session_state["card_extra_pct"] = 25.0
-        if "amount_tolerance_pct" not in st.session_state:
-            st.session_state["amount_tolerance_pct"] = 25.0
+        if not st.session_state.get("profit_compare_loaded", False):
+            profit_cfg = load_profit_compare_settings()
+            st.session_state["fx_cny_to_twd"] = float(profit_cfg.get("fx_cny_to_twd", 5.0))
+            st.session_state["card_extra_pct"] = float(profit_cfg.get("card_extra_pct", 25.0))
+            st.session_state["amount_tolerance_pct"] = float(profit_cfg.get("amount_tolerance_pct", 25.0))
+            st.session_state["profit_compare_loaded"] = True
+            st.session_state["profit_compare_persisted"] = (
+                float(st.session_state["fx_cny_to_twd"]),
+                float(st.session_state["card_extra_pct"]),
+                float(st.session_state["amount_tolerance_pct"]),
+            )
         with st.expander("💱 利潤比對設定", expanded=False):
             st.number_input(
                 "自訂匯率（1 CNY = ? TWD）",
@@ -2684,40 +2855,155 @@ div[data-testid="stCheckbox"]:hover label span[style] {
                 format="%.1f",
                 key="amount_tolerance_pct",
             )
+        current_profit_cfg = (
+            float(st.session_state.get("fx_cny_to_twd", 5.0) or 5.0),
+            float(st.session_state.get("card_extra_pct", 25.0) or 25.0),
+            float(st.session_state.get("amount_tolerance_pct", 25.0) or 25.0),
+        )
+        if st.session_state.get("profit_compare_persisted") != current_profit_cfg:
+            save_err = save_profit_compare_settings(
+                fx_cny_to_twd=current_profit_cfg[0],
+                card_extra_pct=current_profit_cfg[1],
+                amount_tolerance_pct=current_profit_cfg[2],
+            )
+            if save_err:
+                st.warning(f"⚠️ 利潤比對設定儲存失敗：{save_err}")
+            else:
+                st.session_state["profit_compare_persisted"] = current_profit_cfg
         st.markdown("##### 🛒 同步與進度")
-        st.caption("已啟用本地草稿：刷新頁面可自動恢復未同步暫存。")
+        if resume_ready:
+            reset_resume_clicked = st.button(
+                "🗑️ 捨棄目前暫存，重新上傳新報表",
+                key="reset_resume_and_reupload",
+                use_container_width=True,
+            )
+            if reset_resume_clicked:
+                _clear_local_staged_draft(preferred_resume_scope)
+                _clear_local_review_resume(preferred_resume_scope)
+                st.session_state["preferred_resume_scope"] = ""
+                st.session_state["staged_actions"] = []
+                st.session_state["staged_draft_scope"] = ""
+                st.session_state["staged_draft_loaded_scope"] = ""
+                st.session_state["uploaded_file_cached_bytes"] = None
+                st.session_state["uploaded_file_cached_name"] = ""
+                st.session_state["uploaded_file"] = None
+                st.rerun()
         staged_actions = _dedupe_staged_actions_by_uid(_staged_actions())
         if len(staged_actions) != len(_staged_actions()):
             _set_staged_actions(staged_actions)
         legacy_archive_actions = list(st.session_state.get("legacy_archive_actions") or [])
-        total_sync_count = len(staged_actions) + len(legacy_archive_actions)
         manual_count = len(staged_actions)
+        staged_write_count = sum(
+            1 for a in staged_actions
+            if str(a.get("action_type", "")).strip().lower() == "write"
+        )
         auto_archive_count = len(legacy_archive_actions)
-        st.caption(
-            f"待同步：手動暫存 {manual_count} 筆"
-            f"／自動封存 {auto_archive_count} 筆"
+        kpi_pending, kpi_filtered = st.columns(2)
+        kpi_pending.metric("⏳ 編輯中（待入庫）", f"{manual_count} 筆")
+        kpi_filtered.metric("✅ 已過濾（不處理）", f"{auto_archive_count} 筆")
+        st.caption("🏠 換電腦接關提醒：記得 Push 到 Git 讓進度同步！")
+        if auto_archive_count > 0:
+            st.warning(
+                f"⚠️ 偵測到 {auto_archive_count} 筆資料的完成日期 <= 雲端水位線 "
+                f"({hwm_date.strftime('%Y-%m-%d')})，已自動排除以防止重複入帳。"
+            )
+            with st.expander("查看自動排除明細", expanded=False):
+                filtered_view = legacy_archive_orders.copy()
+                if not filtered_view.empty:
+                    show_cols = [c for c in ["合併原始名稱", "訂單成立日期", "買家帳號", "商品原價"] if c in filtered_view.columns]
+                    st.dataframe(
+                        filtered_view[show_cols],
+                        hide_index=True,
+                        width="stretch",
+                        height=220,
+                    )
+                    filtered_csv = filtered_view.to_csv(index=False).encode("utf-8-sig")
+                    filtered_fn = f"filtered_orders_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+                    st.download_button(
+                        label="下載自動排除明細 (CSV)",
+                        data=filtered_csv,
+                        file_name=filtered_fn,
+                        mime="text/csv",
+                        key=f"dl_filtered_orders_{active_batch_id or 'na'}",
+                    )
+                else:
+                    st.caption("目前無可顯示的自動排除明細。")
+        sync_btn_text = f"🚀 確認寫入雲端正式帳本 ({staged_write_count} 筆)"
+        invalid_cost_actions: list[dict] = []
+        for a in staged_actions:
+            if str(a.get("action_type", "")).strip().lower() != "write":
+                continue
+            c0 = _money_to_float(a.get("selected_cost_snapshot", ""))
+            if c0 is None or float(c0) <= 0:
+                c0 = _money_to_float(a.get("unit_cost", ""))
+            if c0 is None or float(c0) <= 0:
+                invalid_cost_actions.append(a)
+        atomic_gate_ok = (staged_write_count > 0) and (len(invalid_cost_actions) == 0)
+        if staged_write_count <= 0:
+            st.warning("⚠️ 目前沒有可同步寫入的有效暫存資料。")
+        elif invalid_cost_actions:
+            st.error(
+                f"⛔ 原子化同步閘門已啟動：尚有 {len(invalid_cost_actions)} 筆暫存成本未填寫或 <= 0，"
+                "暫時禁止同步雲端。"
+            )
+        btn_preview_col, btn_sync_col = st.columns([1, 1])
+        preview_clicked = btn_preview_col.button(
+            "🔍 預覽本次利潤戰報",
+            key="preview_battle_report_button",
+            use_container_width=True,
         )
-        st.caption(
-            "系統會自動寫入批次摘要到 Batch_Sync_Logs（無需額外勾選）。"
-        )
-        if auto_archive_count > 0 and manual_count == 0:
-            st.info("目前待同步筆數來自「接管日前封存」自動項目，非手動暫存。")
-        if manual_count > 0 and auto_archive_count > 0:
-            sync_btn_text = f"🚀 同步手動暫存 + 自動封存（{total_sync_count} 筆）"
-        elif manual_count > 0:
-            sync_btn_text = f"🚀 同步手動暫存（{manual_count} 筆）"
-        elif auto_archive_count > 0:
-            sync_btn_text = f"🚀 同步自動封存（{auto_archive_count} 筆）"
-        else:
-            sync_btn_text = "🚀 同步本次暫存（0 筆）"
-        if st.button(
+        sync_clicked = btn_sync_col.button(
             sync_btn_text,
             type="primary",
             key="staged_commit_button",
-        ):
-            if not staged_actions and not legacy_archive_actions:
+            use_container_width=True,
+            disabled=not atomic_gate_ok,
+        )
+        st.divider()
+        with st.expander("⚙️ 暫存管理 / 進階維護", expanded=False):
+            confirm_discard = st.checkbox(
+                "我確認要清空本次暫存",
+                key="confirm_discard_staged",
+                value=False,
+            )
+            discard_clicked = st.button(
+                "🗑️ 清空暫存並重來",
+                key="staged_discard_button",
+                help="💡 僅清空本次網頁上點選的進度與水位線重複過濾項目，讓您重新操作。絕對不會刪除雲端 Google Sheet 上的既有資料。",
+                disabled=not confirm_discard,
+            )
+        if preview_clicked:
+            if not staged_actions:
+                st.warning("目前沒有可預覽的寫入項目。")
+            elif cloud_df is None or cloud_df.empty:
+                st.error("目前無法讀取雲端目錄，暫時不能預覽戰報。")
+            elif not active_batch_id:
+                st.error("目前批次資訊不完整，暫時不能預覽戰報。")
+            else:
+                try:
+                    preview_writes = [
+                        a for a in staged_actions
+                        if str(a.get("action_type", "")).lower() == "write"
+                    ]
+                    if not preview_writes:
+                        st.warning("目前暫存皆為略過項目，沒有可預覽的戰報。")
+                    else:
+                        preview_snapshot = _build_final_report_snapshot(
+                            preview_writes,
+                            cloud_df=cloud_df,
+                            batch_id=str(active_batch_id or ""),
+                            csv_fp=str(csv_fp or ""),
+                            csv_name=str(csv_name or ""),
+                        )
+                        st.session_state["PREVIEW_REPORT_SNAPSHOT"] = preview_snapshot
+                        st.session_state["preview_report_expanded"] = True
+                        st.success("已產生同步前預覽戰報（未寫入雲端、未存檔）。")
+                except Exception as e:
+                    _show_user_error("戰報預覽建立失敗，請先修正資料後再試。", e)
+        if sync_clicked:
+            if not staged_actions:
                 st.warning("目前沒有可同步的項目。")
-            elif not can_history or not active_batch_id:
+            elif (not can_history) or (not active_batch_id) or (hwm_col_idx is None):
                 st.error("目前無法連線歷史紀錄，暫時不能同步。")
             else:
                 final_snapshot: dict[str, object] | None = None
@@ -2735,7 +3021,6 @@ div[data-testid="stCheckbox"]:hover label span[style] {
                             csv_name=str(csv_name or ""),
                         )
                         st.session_state["FINAL_REPORT_SNAPSHOT"] = final_snapshot
-                        _save_local_final_report_cache(final_snapshot)
                     with st.spinner("同步中，請稍候..."):
                         write_ops = [
                             {
@@ -2744,6 +3029,8 @@ div[data-testid="stCheckbox"]:hover label span[style] {
                                 "buyer_account": str(a.get("buyer_account", "") or ""),
                                 "sale_price": a.get("sale_price", ""),
                                 "fee_value": a.get("fee_value", ""),
+                                "order_completed_date": str(a.get("order_created_at", "") or ""),
+                                "completed_date_col_index": int(hwm_col_idx or 0),
                             }
                             for a in writes
                         ]
@@ -2759,7 +3046,7 @@ div[data-testid="stCheckbox"]:hover label span[style] {
                             append_history_actions_batch,
                             cred_path,
                             spreadsheet_id,
-                            staged_actions + legacy_archive_actions,
+                            staged_actions,
                             retries=3,
                         )
                         if writes:
@@ -2772,7 +3059,6 @@ div[data-testid="stCheckbox"]:hover label span[style] {
                                     csv_name=str(csv_name or ""),
                                 )
                             st.session_state["FINAL_REPORT_SNAPSHOT"] = final_snapshot
-                            _save_local_final_report_cache(final_snapshot)
                             snapshot_row = [
                                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                 datetime.now().strftime("%Y-%m"),
@@ -2791,10 +3077,11 @@ div[data-testid="stCheckbox"]:hover label span[style] {
                                 snapshot_row,
                                 retries=3,
                             )
+                            save_to_archive(final_snapshot)
                         else:
                             st.session_state["FINAL_REPORT_SNAPSHOT"] = None
                     local_map_now = dict(st.session_state.get("local_synced_action_map") or {})
-                    for a in (staged_actions + legacy_archive_actions):
+                    for a in staged_actions:
                         uid_now = str(a.get("order_uid", "") or "").strip()
                         act_now = str(a.get("action_type", "") or "").strip().lower()
                         if uid_now and act_now in {"write", "skip"}:
@@ -2818,7 +3105,9 @@ div[data-testid="stCheckbox"]:hover label span[style] {
                         ,retries=3
                     )
                     _set_staged_actions([])
-                    _clear_local_staged_draft(str(st.session_state.get("staged_draft_scope", "") or ""))
+                    _clear_all_local_staged_drafts()
+                    _clear_all_local_review_resumes()
+                    # 成功後 rerun，會重新從雲端計算最新水位線並更新第一步建議。
                     st.session_state["legacy_archive_actions"] = []
                     st.session_state["history_cache_dirty"] = True
                     st.session_state["force_history_sync"] = True
@@ -2827,14 +3116,14 @@ div[data-testid="stCheckbox"]:hover label span[style] {
                         "csv_fp": str(csv_fp or ""),
                         "batch_id": str(active_batch_id or ""),
                         "manual_count": int(len(staged_actions)),
-                        "archive_count": int(len(legacy_archive_actions)),
+                        "archive_count": 0,
                         "writes_count": int(len(writes)),
                     }
                     st.balloons()
                     st.success(
                         "✅ 本次同步完成："
                         f"一般 {len(staged_actions)} 筆，"
-                        f"封存 {len(legacy_archive_actions)} 筆。"
+                        "自動排除資料未進入同步 payload。"
                     )
                     if writes:
                         st.caption(
@@ -2842,28 +3131,23 @@ div[data-testid="stCheckbox"]:hover label span[style] {
                         )
                     else:
                         st.caption("ℹ️ 本次同步皆為略過，未產生新的批次摘要。")
+                    st.session_state["PREVIEW_REPORT_SNAPSHOT"] = None
+                    st.session_state["preview_report_expanded"] = False
                     st.rerun()
                 except Exception as e:
                     # 若同步末段失敗，保留快照供人工補跑/對帳。
                     if isinstance(final_snapshot, dict):
                         st.session_state["FINAL_REPORT_SNAPSHOT"] = final_snapshot
-                        _save_local_final_report_cache(final_snapshot)
                     _show_user_error("同步失敗，請稍後再試。", e)
-        confirm_discard = st.checkbox(
-            "我確認要清空本次暫存",
-            key="confirm_discard_staged",
-            value=False,
-        )
-        if st.button(
-            "🗑️ 清空暫存並重來",
-            key="staged_discard_button",
-            help="💡 僅清空本次網頁上點選的進度與接管日前封存項目，讓您重新操作。絕對不會刪除雲端 Google Sheet 上的既有資料。",
-            disabled=not confirm_discard,
-        ):
+        if discard_clicked:
             for a in reversed(staged_actions):
                 _revert_optimistic_action(a)
             _set_staged_actions([])
-            _clear_local_staged_draft(str(st.session_state.get("staged_draft_scope", "") or ""))
+            scope_now = str(st.session_state.get("staged_draft_scope", "") or "")
+            _clear_local_staged_draft(scope_now)
+            _clear_local_review_resume(scope_now)
+            st.session_state["PREVIEW_REPORT_SNAPSHOT"] = None
+            st.session_state["preview_report_expanded"] = False
             st.session_state["legacy_archive_actions"] = []
             st.session_state["force_catalog_sync"] = True
             st.session_state["force_history_sync"] = True
@@ -4053,6 +4337,23 @@ div[data-testid="stCheckbox"]:hover label span[style] {
         and str(success_payload.get("csv_fp", "") or "") == str(csv_fp or "")
     )
     show_success_panel = bool(all_done or payload_match)
+    preview_snapshot = st.session_state.get("PREVIEW_REPORT_SNAPSHOT")
+    show_preview_panel = (
+        isinstance(preview_snapshot, dict)
+        and int(preview_snapshot.get("writes_count", 0) or 0) > 0
+        and str(preview_snapshot.get("csv_fp", "") or "") == str(csv_fp or "")
+        and not show_success_panel
+    )
+    if show_preview_panel:
+        with st.expander(
+            "👁️ 查看預覽戰報詳情",
+            expanded=bool(st.session_state.get("preview_report_expanded", True)),
+        ):
+            preview_view = dict(preview_snapshot)
+            preview_view["_widget_key_scope"] = "preview_" + str(active_batch_id or "na")
+            preview_view["_preview_mode"] = True
+            render_battle_report(preview_view)
+
     if show_success_panel:
         celeb_key = f"batch_done_balloons_{csv_fp}_{active_batch_id or 'na'}"
         if all_done and not st.session_state.get(celeb_key, False):
@@ -4083,253 +4384,17 @@ div[data-testid="stCheckbox"]:hover label span[style] {
         mc2.metric("成功寫入", n_write)
         mc3.metric("略過", n_skip)
         final_snapshot = st.session_state.get("FINAL_REPORT_SNAPSHOT")
-        if not isinstance(final_snapshot, dict):
-            cached_snapshot = _load_local_final_report_cache()
-            if isinstance(cached_snapshot, dict):
-                st.session_state["FINAL_REPORT_SNAPSHOT"] = cached_snapshot
-                final_snapshot = cached_snapshot
         if (
             isinstance(final_snapshot, dict)
             and int(final_snapshot.get("writes_count", 0) or 0) > 0
             and str(final_snapshot.get("csv_fp", "") or "") == str(csv_fp or "")
         ):
-            with st.expander("🏆 檢視本批次結算戰報 (點擊展開)", expanded=False):
-                rows_df = pd.DataFrame(final_snapshot.get("audit_rows") or [])
+            with st.expander('🏆 檢視本批次結算戰報 (點擊展開)', expanded=False):
+                snap = dict(final_snapshot)
+                scope_live = str(bid or active_batch_id or csv_fp or "live")[:48]
+                snap["_widget_key_scope"] = re.sub(r'[^\w\-]', '_', scope_live)
+                render_battle_report(snap)
 
-                if not rows_df.empty:
-                    total_rev = int(round(pd.to_numeric(rows_df["實售收入"], errors="coerce").fillna(0.0).sum()))
-                    total_fee = int(round(pd.to_numeric(rows_df["手續費"], errors="coerce").fillna(0.0).sum()))
-                    total_cost = int(round(pd.to_numeric(rows_df["成本"], errors="coerce").fillna(0.0).sum()))
-                    total_profit = int(round(pd.to_numeric(rows_df["淨利潤"], errors="coerce").fillna(0.0).sum()))
-                    avg_fee_rate = (float(total_fee) / float(total_rev)) if total_rev > 0 else 0.0
-                else:
-                    total_rev = int(final_snapshot.get("total_revenue", 0) or 0)
-                    total_fee = int(final_snapshot.get("total_fee", 0) or 0)
-                    total_cost = int(final_snapshot.get("total_cost", 0) or 0)
-                    avg_fee_rate = float(final_snapshot.get("avg_fee_rate", 0.0) or 0.0)
-                    total_profit = int(final_snapshot.get("total_profit", 0) or 0)
-                margin_pct = (float(total_profit) / float(total_rev) * 100.0) if total_rev > 0 else 0.0
-                rank_text = "🥇 Rank A：穩定輸出！健康的營運批次。"
-                rank_color = "#2563eb"
-                if margin_pct > 20:
-                    rank_text = "🏆 Rank S：暴利收割機！本批次利潤極佳！"
-                    rank_color = "#047857"
-                elif 10 <= margin_pct <= 20:
-                    rank_text = "🥇 Rank A：穩定輸出！健康的營運批次。"
-                    rank_color = "#2563eb"
-                elif 5 <= margin_pct < 10:
-                    rank_text = "⚠️ Rank B：薄利多銷。留意潛在的成本波動。"
-                    rank_color = "#b45309"
-                elif margin_pct < 5:
-                    rank_text = "🚨 Rank C：蝦皮打工仔警報！利潤過低，請立刻檢視手續費與定價！"
-                    rank_color = "#b91c1c"
-                st.markdown(
-                    (
-                        "<div style='border:1px solid #e5e7eb;border-radius:12px;padding:10px 12px;"
-                        "background:linear-gradient(135deg,#f8fafc 0%,#ffffff 100%);margin-bottom:10px;'>"
-                        f"<div style='font-size:1.05rem;font-weight:900;color:{rank_color};'>{html.escape(rank_text)}</div>"
-                        f"<div style='font-size:0.82rem;color:#64748b;margin-top:3px;'>毛利率：{margin_pct:.2f}%</div>"
-                        "</div>"
-                    ),
-                    unsafe_allow_html=True,
-                )
-
-                left_metrics, right_chart = st.columns([1.35, 1.0])
-                with left_metrics:
-                    h1, h2, h3, h4 = st.columns(4)
-                    with h1:
-                        st.markdown(
-                            _battle_metric_card_html(
-                                "💰 總實收",
-                                f"{total_rev:,}",
-                                "TWD",
-                                accent="#0f172a",
-                            ),
-                            unsafe_allow_html=True,
-                        )
-                    with h2:
-                        st.markdown(
-                            _battle_metric_card_html(
-                                "💸 總手續費",
-                                f"{total_fee:,}",
-                                "TWD",
-                                accent="#7c2d12",
-                            ),
-                            unsafe_allow_html=True,
-                        )
-                    with h3:
-                        fee_title = "📊 平均費率 ⚠️" if (avg_fee_rate * 100.0) > 11.0 else "📊 平均費率"
-                        st.markdown(
-                            _battle_metric_card_html(
-                                fee_title,
-                                f"{avg_fee_rate * 100.0:.2f}",
-                                "%",
-                                accent="#1d4ed8",
-                            ),
-                            unsafe_allow_html=True,
-                        )
-                    with h4:
-                        badge_text = f"毛利率 {margin_pct:.1f}%"
-                        badge_bg = "#dcfce7" if total_profit >= 0 else "#fee2e2"
-                        badge_fg = "#166534" if total_profit >= 0 else "#b91c1c"
-                        st.markdown(
-                            _battle_metric_card_html(
-                                "🏆 淨利潤",
-                                f"{total_profit:,}",
-                                "TWD",
-                                accent="#047857" if total_profit >= 0 else "#b91c1c",
-                                badge_text=badge_text,
-                                badge_bg=badge_bg,
-                                badge_fg=badge_fg,
-                            ),
-                            unsafe_allow_html=True,
-                        )
-                with right_chart:
-                    # donut 不接受負值，淨利若為負，圖中以 0 顯示並在下方提示。
-                    donut_profit = max(0, int(total_profit))
-                    if go is not None:
-                        fig = go.Figure(
-                            data=[
-                                go.Pie(
-                                    labels=["總成本", "總手續費", "總淨利潤"],
-                                    values=[max(0, int(total_cost)), max(0, int(total_fee)), donut_profit],
-                                    hole=0.62,
-                                    marker=dict(colors=["#64748b", "#f59e0b", "#10b981"]),
-                                    textinfo="label+percent",
-                                )
-                            ]
-                        )
-                        fig.update_layout(
-                            margin=dict(l=0, r=0, t=6, b=0),
-                            paper_bgcolor="rgba(0,0,0,0)",
-                            plot_bgcolor="rgba(0,0,0,0)",
-                            showlegend=False,
-                        )
-                        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-                    else:
-                        st.caption("ℹ️ 未安裝 plotly，暫以文字版營收結構顯示。")
-                        st.dataframe(
-                            pd.DataFrame(
-                                [
-                                    {"項目": "總成本", "金額 (TWD)": f"{max(0, int(total_cost)):,}"},
-                                    {"項目": "總手續費", "金額 (TWD)": f"{max(0, int(total_fee)):,}"},
-                                    {"項目": "總淨利潤", "金額 (TWD)": f"{donut_profit:,}"},
-                                ]
-                            ),
-                            hide_index=True,
-                            width="stretch",
-                            height=145,
-                        )
-                    if total_profit < 0:
-                        st.caption("⚠️ 本批次淨利為負，圓餅圖之淨利扇區以 0 呈現。")
-
-                st.divider()
-                if rows_df.empty:
-                    st.info("目前僅有摘要資料，未能取得本批次明細項目，行動洞察暫不可用。")
-                else:
-                    low_profit_df = rows_df[rows_df["淨利潤"] < 0].copy()
-                    high_fee_df = rows_df[rows_df["手續費率"] > 0.13].copy()
-                    guardians_df = rows_df.reindex(
-                        rows_df["淨利潤"].abs().sort_values(ascending=False).index
-                    ).head(2).copy()
-
-                    st.markdown("#### 🧭 營運行動清單")
-                    if not low_profit_df.empty:
-                        st.error("🩸 做白工/虧損清單：強烈建議調漲售價。")
-                        low_profit_show = (
-                            low_profit_df[["商品原始名稱", "淨利潤"]]
-                            .rename(columns={"淨利潤": "利潤 (TWD)"})
-                            .assign(**{"利潤 (TWD)": lambda d: d["利潤 (TWD)"].round(0).astype(int)})
-                        )
-                        with st.expander(f"🩸 查看做白工/虧損清單（{len(low_profit_show)} 筆）", expanded=False):
-                            st.dataframe(
-                                low_profit_show,
-                                hide_index=True,
-                                width="stretch",
-                                height=170,
-                            )
-                            st.download_button(
-                                label="下載做白工/虧損清單 (CSV)",
-                                data=low_profit_show.to_csv(index=False).encode("utf-8-sig"),
-                                file_name="audit_low_profit_list.csv",
-                                mime="text/csv",
-                                key=f"dl_low_profit_{bid or 'na'}",
-                            )
-                    else:
-                        st.success("🩸 做白工/虧損清單：本批次未發現利潤 < 0 的商品。")
-
-                    if not high_fee_df.empty:
-                        st.error("🧛 高抽成刺客清單：請檢查是否誤開免運或促銷活動。")
-                        high_fee_show = (
-                            high_fee_df[["商品原始名稱", "手續費率"]]
-                            .assign(手續費率=lambda d: (d["手續費率"] * 100.0).round(2).map(lambda v: f"{v:.2f}%"))
-                        )
-                        with st.expander(f"🧛 查看高抽成刺客清單（{len(high_fee_show)} 筆）", expanded=False):
-                            st.dataframe(
-                                high_fee_show,
-                                hide_index=True,
-                                width="stretch",
-                                height=170,
-                            )
-                            st.download_button(
-                                label="下載高抽成刺客清單 (CSV)",
-                                data=high_fee_show.to_csv(index=False).encode("utf-8-sig"),
-                                file_name="audit_high_fee_list.csv",
-                                mime="text/csv",
-                                key=f"dl_high_fee_{bid or 'na'}",
-                            )
-                    else:
-                        st.success("🧛 高抽成刺客清單：本批次未發現手續費率 > 13% 的商品。")
-
-                    st.info("👑 利潤守護者：主力推廣商品（單筆利潤絕對值最高前 2 名）。")
-                    guardians_show = (
-                        guardians_df[["商品原始名稱", "淨利潤"]]
-                        .rename(columns={"淨利潤": "利潤 (TWD)"})
-                        .assign(**{"利潤 (TWD)": lambda d: d["利潤 (TWD)"].round(0).astype(int)})
-                    )
-                    with st.expander(f"👑 查看利潤守護者（{len(guardians_show)} 筆）", expanded=False):
-                        st.dataframe(
-                            guardians_show,
-                            hide_index=True,
-                            width="stretch",
-                            height=150,
-                        )
-                        st.download_button(
-                            label="下載利潤守護者清單 (CSV)",
-                            data=guardians_show.to_csv(index=False).encode("utf-8-sig"),
-                            file_name="audit_profit_guardians.csv",
-                            mime="text/csv",
-                            key=f"dl_guardians_{bid or 'na'}",
-                        )
-            # 查帳明細表：唯一來源 FINAL_REPORT_SNAPSHOT。
-            audit_df = rows_df.copy() if isinstance(rows_df, pd.DataFrame) else pd.DataFrame()
-            if not audit_df.empty:
-                st.markdown("##### 📋 批次查帳明細表 (含總計回饋)")
-                audit_view = audit_df[
-                    [c for c in ["商品原始名稱", "實售收入", "成本", "成本來源", "手續費", "淨利潤"] if c in audit_df.columns]
-                ].copy()
-                for c in ["實售收入", "成本", "手續費", "淨利潤"]:
-                    audit_view[c] = pd.to_numeric(audit_view[c], errors="coerce").fillna(0.0)
-                totals = {
-                    "實售收入": int(round(float(audit_view["實售收入"].sum()))),
-                    "成本": int(round(float(audit_view["成本"].sum()))),
-                    "手續費": int(round(float(audit_view["手續費"].sum()))),
-                    "淨利潤": int(round(float(audit_view["淨利潤"].sum()))),
-                }
-                for c in ["實售收入", "成本", "手續費", "淨利潤"]:
-                    audit_view[c] = audit_view[c].round(0).astype(int)
-                with st.expander(f"📋 批次查帳明細表 (含總計回饋，共 {len(audit_view)} 筆明細)", expanded=True):
-                    st.dataframe(audit_view, hide_index=True, width="stretch", height=260)
-                    st.markdown(
-                        f"**總計回饋｜實售收入：{totals['實售收入']:,}｜成本：{totals['成本']:,}｜手續費：{totals['手續費']:,}｜淨利潤：{totals['淨利潤']:,}**"
-                    )
-                    st.download_button(
-                        label="下載查帳明細表 (CSV)",
-                        data=audit_view.to_csv(index=False).encode("utf-8-sig"),
-                        file_name="audit_detail_with_total.csv",
-                        mime="text/csv",
-                        key=f"dl_audit_detail_{bid or 'na'}",
-                    )
         summary_df = _build_batch_summary_df(
             result, history_actions, active_batch_id, history_detail_map
         )
@@ -4353,8 +4418,9 @@ div[data-testid="stCheckbox"]:hover label span[style] {
             )
 
         if st.button("🔄 處理下一份報表 (清除目前畫面)", type="primary"):
-            _clear_local_staged_draft(str(st.session_state.get("staged_draft_scope", "") or ""))
-            _clear_local_final_report_cache()
+            scope_now = str(st.session_state.get("staged_draft_scope", "") or "")
+            _clear_local_staged_draft(scope_now)
+            _clear_local_review_resume(scope_now)
             # Graceful Reset：只清「本批次」相關的 UI/進度狀態，保留雲端目錄與商品字典快取
             keep_keys = {
                 "cloud_catalog_df",
@@ -4409,10 +4475,13 @@ div[data-testid="stCheckbox"]:hover label span[style] {
                 "local_synced_action_map",
                 "staged_draft_scope",
                 "staged_draft_loaded_scope",
+                "preferred_resume_scope",
                 "review_meta_scope",
                 "review_meta_cache",
                 "sync_success_payload",
                 "FINAL_REPORT_SNAPSHOT",
+                "PREVIEW_REPORT_SNAPSHOT",
+                "preview_report_expanded",
             }
 
             for k in list(st.session_state.keys()):
@@ -4430,27 +4499,24 @@ div[data-testid="stCheckbox"]:hover label span[style] {
     show_pre_sync_preview = has_staged_pending and (not all_done)
     if show_pre_sync_preview:
         st.caption("📝 以下資料為本地端即時解析與估算結果，尚未寫入雲端。")
-        with st.expander("🛠️ 進階與除錯狀態", expanded=False):
+        with st.expander("⚙️ 進階除錯（同步前）", expanded=False):
             if st.button("重新整理本頁完成狀態（不影響雲端資料）", key="reset_done_flags"):
                 for pos, idx in enumerate(result.index):
                     st.session_state.pop(f"done_r_{pos}_{idx}", None)
                 st.rerun()
-
-        with st.expander("📋 檢視完整處理結果表格 (同步前預覽)", expanded=False):
+            st.caption("📋 檢視完整處理結果表格")
             st.dataframe(result, width="stretch", height=420)
 
-        csv_out = result.to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            label="下載本地預覽結果 (CSV)",
-            data=csv_out,
-            file_name="shopee_orders_processed.csv",
-            mime="text/csv",
-        )
-
-        recon_df = build_accounting_reconciliation_df(df, result, order_total_fees)
-        with st.expander("📊 查看會計對帳明細 (同步前預覽)", expanded=False):
             st.caption("逐訂單：原始總金額 vs 展開後金額、訂單總手續費 vs 整數分攤加總。")
+            recon_df = build_accounting_reconciliation_df(df, result, order_total_fees)
             st.dataframe(recon_df, width="stretch", height=360)
+            csv_out = result.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                label="下載本地預覽結果 (CSV)",
+                data=csv_out,
+                file_name="shopee_orders_processed.csv",
+                mime="text/csv",
+            )
 
 
 if __name__ == "__main__":

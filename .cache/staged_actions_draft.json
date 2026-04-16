@@ -1,0 +1,47 @@
+{
+  "Order.completed.20260401_20260415.xlsx|7c1c206c12949c4b4bbe6fc5e4fd20feccd406c9d1368ab065a335e152239923|1Kisr-7t_85DHpPkk-qmald_C5Qpm6oAGIFGO3cYF-uo|預定(大陸現貨)|C:\\Users\\Kenny ho\\iProgram\\ShopeeOrderSync\\credentials.json": [
+    {
+      "batch_id": "20260416_104626_Order.completed.20260401_20260415.xlsx",
+      "upload_time": "2026-04-16 10:46:26",
+      "filename": "Order.completed.20260401_20260415.xlsx",
+      "order_uid": "7a57ddb66564545ade14",
+      "action_type": "write",
+      "target_row": 391,
+      "original_data": {
+        "平台": "預現貨",
+        "買家": "",
+        "賣場售價": "",
+        "賣場手續費": ""
+      },
+      "last_hint": "2026-04-01 21:48 的 hsiaowunwen (訂單: 260401NTX6GB6C)",
+      "raw_name": "🏠 宅玩瘋 💥 戀戀koikoi 虎娘 美美 -櫻- 手感漆 1/6｜台灣現貨＋預定｜【模型】 現貨：24 小時內出貨",
+      "header_index_1based": {
+        "品名": 3,
+        "款式細項": 4,
+        "平台": 5,
+        "買家": 6,
+        "賣場售價": 22,
+        "賣場手續費": 23
+      },
+      "buyer_account": "hsiaowunwen",
+      "sale_price": 1680.0,
+      "fee_value": 194,
+      "est_profit_twd": 192.0,
+      "unit_cost": 1294.0,
+      "original_cost": "",
+      "selected_cost_source": "cloud_target_row",
+      "selected_cost_snapshot": 1294.0,
+      "std_keyword": "恋恋樱虎娘美美1/6正版手办 全高约26.5cm",
+      "prev_dict_keyword": "",
+      "before_local": {
+        "平台": "預現貨",
+        "買家": "",
+        "賣場售價": "",
+        "賣場手續費": ""
+      },
+      "order_created_at": "2026-04-01 21:48",
+      "stock_tag": "現貨",
+      "expected_platform": "預現貨"
+    }
+  ]
+}
